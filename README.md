@@ -31,17 +31,17 @@ count, and the client receives exactly that many frames.
 ## Define a command
 
 ```python
-from fasttcpapi import FastTcpAPI
+from fasttcpapi import Server
 
-app = FastTcpAPI()
+server = Server()
 
-@app.command("user.get")
+@server.command("user.get")
 async def get_user(user_id: int, verbose: bool = False):
     return {"id": user_id, "verbose": verbose}
 
-@app.command("clock.watch", response_frames=3)
+@server.command("clock.watch", response_frames=2)
 async def watch_clock():
-    for tick in range(3):
+    for tick in range(2):
         yield {"tick": tick}
 ```
 
@@ -53,7 +53,7 @@ error response. `CommandError` optionally provides `code` and `solution`
 attributes.
 
 ```python
-@app.command("sensor.read", response_frames=2)
+@server.command("sensor.read", response_frames=2)
 def read_sensor():
     yield {"channel": 1, "value": 12.5}
     yield {"channel": 2, "value": 13.0}
@@ -64,9 +64,28 @@ If a handler produces fewer results, the server sends one error frame. Results
 after the declared count are discarded to preserve the request/response frame
 boundary.
 
+### Active pushes
+
+Use `push` for a handler that starts once per TCP connection. It may return one
+value or continuously yield values; every value is sent immediately as an
+unsolicited frame:
+
+```python
+@server.push("clock.push")
+async def push_clock():
+    while True:
+        yield {"unix_time": time.time()}
+        await asyncio.sleep(1)
+```
+
+Push tasks run concurrently with normal command handling and are cancelled when
+the connection closes. A client for a custom protocol must distinguish push
+frames from command responses using the command field or its equivalent. The
+complete default-frame example is `python examples/push_server.py`.
+
 ## Custom frames
 
-Implement `Frame`, then pass the class to `FastTcpAPI`. A frame instance is
+Implement `Frame`, then pass the class to `Server`. A frame instance is
 created for each incoming request. Its lifecycle is:
 
 ```text
@@ -111,10 +130,12 @@ class MyFrame(Frame):
         raise RuntimeError(self.args[0])
 
     def encode(self):
+        if self.command == b"\x82":
+            return self.command + str(self.args[0]).encode("utf-8")
         return self.command + int(self.args[0]).to_bytes(4, "little")
 
 
-app = FastTcpAPI(MyFrame)
+app = Server(MyFrame)
 
 @app.command(b"\x01")
 def command(value: int):
@@ -147,7 +168,7 @@ protocol.
 
 ## Client
 
-`Client` supports the built-in `JsonLengthPrefixFrame` protocol. Start the
+`AsyncClient` supports the built-in `JsonLengthPrefixFrame` protocol. Start the
 server, then run the included client example in another terminal:
 
 ```console
@@ -162,7 +183,7 @@ client = AsyncClient("127.0.0.1", 9000)
 await client.connect()  # Fetches the server's public command definitions.
 
 message = await client.echo("FastTcpAPI", prefix="Hello, ")
-ticks = await client.call("clock.watch")  # response_frames=3: returns a three-item list.
+ticks = await client.call("clock.watch")  # response_frames=2: returns a two-item list.
 ```
 
 Before sending a command, the client validates positional argument count,
@@ -170,9 +191,10 @@ keyword names, required arguments, and built-in `bool`, `bytes`, `float`,
 `int`, and `str` annotations from the fetched definition. A mismatch raises
 `TypeError` locally; it does not open a command request to the server.
 
-The first connection writes `.fasttcpapi/fasttcpapi_client_127_0_0_1_9000.pyi`.
-It contains the server's valid Python command names and their parameter types,
-so an IDE can use it as a local type-stub artifact. Commands containing dots or
+The first connection writes `fasttcpapi/async_client.pyi` and
+`fasttcpapi/sync_client.pyi`. They contain the server's valid Python command
+names and parameter types, so an IDE can use them as local type-stub artifacts.
+Commands containing dots or
 other non-identifier characters remain callable with:
 
 ```python
@@ -199,4 +221,4 @@ ticks = client.call("clock.watch")
 ```
 
 Run the complete blocking example with `python examples/sync_client.py`.
-`Client` remains an alias for `AsyncClient` for backwards compatibility.
+`FastTcpAPI` remains an alias for `Server` for backwards compatibility.

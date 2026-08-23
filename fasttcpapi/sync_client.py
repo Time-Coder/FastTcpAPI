@@ -13,8 +13,8 @@ from .exceptions import RemoteError
 class SyncClient:
     """Blocking facade over :class:`AsyncClient`."""
 
-    def __init__(self, ip: str, port: int, *, cache_dir: str | Path = ".fasttcpapi") -> None:
-        self._async = AsyncClient(ip, port, cache_dir=cache_dir)
+    def __init__(self, ip: str, port: int) -> None:
+        self._async = AsyncClient(ip, port)
 
     def __getattr__(self, command: str) -> Callable[..., Any]:
         if command.startswith("_"):

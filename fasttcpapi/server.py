@@ -23,12 +23,19 @@ class Route:
     response_frames: int
 
 
+@dataclass(frozen=True)
+class PushRoute:
+    command: Hashable
+    handler: Handler
+
+
 class Server:
     def __init__(self, frame_type: type[Frame] = JsonLengthPrefixFrame) -> None:
         if not issubclass(frame_type, Frame):
             raise TypeError("frame_type must be a Frame subclass")
         self.frame_type = frame_type
         self._routes: dict[Hashable, Route] = {}
+        self._push_routes: list[PushRoute] = []
         self._server: asyncio.AbstractServer | None = None
 
     def command(self, name: Hashable | None = None, *, response_frames: int = 1) -> Callable[[F], F]:
@@ -47,6 +54,24 @@ class Server:
             if command_name in self._routes:
                 raise ValueError(f"command already registered: {command_name}")
             self._routes[command_name] = Route(handler, response_frames)
+            return handler
+        return decorator
+
+    def push(self, name: Hashable | None = None) -> Callable[[F], F]:
+        """Register a handler that starts once for every connected client.
+
+        The handler may return a value, a generator, or an async generator.
+        Every produced value is encoded and sent as an unsolicited push frame.
+        """
+        def decorator(handler: F) -> F:
+            command = handler.__name__ if name is None else name
+            if not isinstance(command, Hashable) or command == "":
+                raise ValueError("push command must be a non-empty hashable value")
+            if command == SCHEMA_COMMAND or command in self._routes:
+                raise ValueError(f"command already registered: {command}")
+            if any(route.command == command for route in self._push_routes):
+                raise ValueError(f"push command already registered: {command}")
+            self._push_routes.append(PushRoute(command, handler))
             return handler
         return decorator
 
@@ -75,6 +100,8 @@ class Server:
             yield value
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer_lock = asyncio.Lock()
+        push_tasks = [asyncio.create_task(self._run_push(route, writer, writer_lock)) for route in self._push_routes]
         try:
             while True:
                 frame = self.frame_type()
@@ -90,8 +117,9 @@ class Server:
                             if sent == route.response_frames:
                                 break
                             frame.decode_from_result(result)
-                            writer.write(frame.encode())
-                            await writer.drain()
+                            async with writer_lock:
+                                writer.write(frame.encode())
+                                await writer.drain()
                             sent += 1
                         if sent != route.response_frames:
                             raise RuntimeError(
@@ -104,11 +132,55 @@ class Server:
                     frame.decode_from_exception(exc)
                     encoded = frame.encode()
                     if encoded:
-                        writer.write(encoded)
-                        await writer.drain()
+                        async with writer_lock:
+                            writer.write(encoded)
+                            await writer.drain()
         finally:
+            for task in push_tasks:
+                task.cancel()
+            if push_tasks:
+                await asyncio.gather(*push_tasks, return_exceptions=True)
             writer.close()
             await writer.wait_closed()
+
+    async def _run_push(
+        self, route: PushRoute, writer: asyncio.StreamWriter, writer_lock: asyncio.Lock
+    ) -> None:
+        frame = self.frame_type()
+        try:
+            value = route.handler()
+            if inspect.isawaitable(value):
+                value = await value
+            if inspect.isasyncgen(value):
+                async for item in value:
+                    await self._send_push(route.command, item, frame, writer, writer_lock)
+            elif inspect.isgenerator(value):
+                for item in value:
+                    await self._send_push(route.command, item, frame, writer, writer_lock)
+            else:
+                await self._send_push(route.command, value, frame, writer, writer_lock)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            frame.decode_from_exception(exc)
+            frame.command = route.command
+            async with writer_lock:
+                writer.write(frame.encode())
+                await writer.drain()
+
+    async def _send_push(
+        self,
+        command: Hashable,
+        result: Any,
+        frame: Frame,
+        writer: asyncio.StreamWriter,
+        writer_lock: asyncio.Lock,
+    ) -> None:
+        frame.decode_from_result(result)
+        frame.command = command
+        async with writer_lock:
+            writer.write(frame.encode())
+            await writer.drain()
 
     async def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
         self._server = await asyncio.start_server(self._handle_client, host, port)

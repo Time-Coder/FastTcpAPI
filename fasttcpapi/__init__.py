@@ -8,7 +8,9 @@ from .exceptions import CommandError, RemoteError
 from .sync_client import SyncClient
 from .frame import Frame, Param
 
+FastTcpAPI = Server
+
 __all__ = [
-    "AsyncClient", "CommandError", "Server", "Frame", "JsonLengthPrefixFrame", "Param",
-    "RemoteError", "SyncClient", "decode_typed_arguments",
+    "AsyncClient", "CommandError", "FastTcpAPI", "Server", "Frame", "JsonLengthPrefixFrame",
+    "Param", "RemoteError", "SyncClient", "decode_typed_arguments",
 ]

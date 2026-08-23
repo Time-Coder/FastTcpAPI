@@ -5,3 +5,4 @@ examples
 tests
 async_client.pyi
 sync_client.pyi
+*.egg-info

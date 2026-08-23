@@ -1,17 +1,40 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "fasttcpapi"
 version = "0.1.0"
 description = "FastAPI-inspired routing for framed TCP protocols"
 readme = "README.md"
-requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "FastTcpAPI contributors" }]
+requires-python = ">=3.7"
+license = "MIT"
+authors = [{ name = "王炳辉 (Bing-Hui WANG)", email = "binghui.wang@foxmail.com" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.7",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Internet",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "auto"
+[project.urls]
+Homepage = "https://github.com/Time-Coder/FastTcpAPI"
+Repository = "https://github.com/Time-Coder/FastTcpAPI.git"
+Issues = "https://github.com/Time-Coder/FastTcpAPI/issues"
 
+[tool.setuptools.packages.find]
+include = ["fasttcpapi*"]
+
+[tool.setuptools.exclude-package-data]
+fasttcpapi = ["*.pyi"]

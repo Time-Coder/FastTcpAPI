@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import re
 import struct
 from pathlib import Path
 from typing import Any, Callable
@@ -21,10 +20,9 @@ class AsyncClient:
     command names that are not valid Python attributes.
     """
 
-    def __init__(self, ip: str, port: int, *, cache_dir: str | Path = ".fasttcpapi") -> None:
+    def __init__(self, ip: str, port: int) -> None:
         self.ip = ip
         self.port = port
-        self.cache_dir = Path(cache_dir)
         self._schema: list[dict[str, Any]] | None = None
         self._lock = asyncio.Lock()
 
@@ -94,7 +92,7 @@ class AsyncClient:
             "from .exceptions import RemoteError",
             "",
             "class AsyncClient:",
-            "    def __init__(self, ip: str, port: int, *, cache_dir: str | Path = ...) -> None: ...",
+            "    def __init__(self, ip: str, port: int) -> None: ...",
             "    async def connect(self) -> None: ...",
             "    async def call(self, command: str, *args: Any, **kwargs: Any) -> Any: ...",
             "    @property",
@@ -106,7 +104,7 @@ class AsyncClient:
             "from .exceptions import RemoteError",
             "",
             "class SyncClient:",
-            "    def __init__(self, ip: str, port: int, *, cache_dir: str | Path = ...) -> None: ...",
+            "    def __init__(self, ip: str, port: int) -> None: ...",
             "    def connect(self) -> None: ...",
             "    def call(self, command: str, *args: Any, **kwargs: Any) -> Any: ...",
             "    @property",
@@ -132,6 +130,7 @@ class AsyncClient:
         if not wrote_method:
             async_lines.append("    pass")
             sync_lines.append("    pass")
+        async_lines.extend(["", "Client = AsyncClient", ""])
         package_dir = Path(__file__).parent
         (package_dir / "async_client.pyi").write_text("\n".join(async_lines) + "\n", encoding="utf-8")
         (package_dir / "sync_client.pyi").write_text("\n".join(sync_lines) + "\n", encoding="utf-8")
@@ -170,7 +169,7 @@ def _runtime_type(type_name: str) -> type[Any] | None:
 
 def _call_error(command: str, message: str) -> str:
     if message.startswith("missing a required argument: "):
-        name = message.removeprefix("missing a required argument: ")
+        name = message[len("missing a required argument: "):]
         return f"{command}() missing 1 required positional argument: {name}"
     if message == "too many positional arguments":
         return f"{command}() takes fewer positional arguments than were given"
