@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 from dataclasses import dataclass
-from collections.abc import AsyncIterator, Callable, Hashable
-from typing import Any, TypeVar, get_type_hints
+from collections.abc import AsyncIterator, Hashable
+from typing import Any, Callable, Dict, List, Optional, Set, Type, TypeVar, Union, get_type_hints
 
 from .default_frame import JsonLengthPrefixFrame
 from .exceptions import CommandError
@@ -21,6 +22,7 @@ SCHEMA_COMMAND = "__fasttcpapi__.schema"
 class Route:
     handler: Handler
     response_frames: int
+    timeout: Union[float, List[float]]
 
 
 @dataclass(frozen=True)
@@ -30,15 +32,39 @@ class PushRoute:
 
 
 class Server:
-    def __init__(self, frame_type: type[Frame] = JsonLengthPrefixFrame) -> None:
+    def __init__(self, frame_type: Type[Frame] = JsonLengthPrefixFrame) -> None:
         if not issubclass(frame_type, Frame):
             raise TypeError("frame_type must be a Frame subclass")
         self.frame_type = frame_type
-        self._routes: dict[Hashable, Route] = {}
-        self._push_routes: list[PushRoute] = []
-        self._server: asyncio.AbstractServer | None = None
+        self._routes: Dict[Hashable, Route] = {}
+        self._push_routes: List[PushRoute] = []
+        self._server: Optional[asyncio.AbstractServer] = None
+        self._writers: Set[asyncio.StreamWriter] = set()
+        self._client_tasks: Set[asyncio.Task] = set()
+        self._on_push: List[Callable[..., Any]] = []
+        self._on_request: List[Callable[..., Any]] = []
+        self._on_response: List[Callable[..., Any]] = []
 
-    def command(self, name: Hashable | None = None, *, response_frames: int = 1) -> Callable[[F], F]:
+    def add_on_push_callback(self, callback: Callable[..., Any]) -> None:
+        self._on_push.append(callback)
+
+    def add_on_request_callback(self, callback: Callable[..., Any]) -> None:
+        self._on_request.append(callback)
+
+    def add_on_response_callback(self, callback: Callable[..., Any]) -> None:
+        self._on_response.append(callback)
+
+    async def _callbacks(self, callbacks: List[Callable[..., Any]], *args: Any) -> None:
+        for callback in callbacks:
+            try:
+                value = callback(*args)
+                if inspect.isawaitable(value):
+                    await value
+            except Exception:
+                continue
+
+    def command(self, name: Optional[Hashable] = None, *, response_frames: int = 1,
+                timeout: Union[float, List[float]] = 30.0) -> Callable[[F], F]:
         """Register a command handler, like ``FastAPI.get`` registers an endpoint."""
         if not isinstance(response_frames, int) or isinstance(response_frames, bool) or response_frames < 1:
             raise ValueError("response_frames must be a positive integer")
@@ -53,11 +79,18 @@ class Server:
                 raise ValueError(f"{SCHEMA_COMMAND} is reserved")
             if command_name in self._routes:
                 raise ValueError(f"command already registered: {command_name}")
-            self._routes[command_name] = Route(handler, response_frames)
+            value = timeout if isinstance(timeout, list) else float(timeout)
+            if isinstance(value, list):
+                if len(value) != response_frames or any(float(item) <= 0 for item in value):
+                    raise ValueError("timeout list must match response_frames and contain positive values")
+                value = [float(item) for item in value]
+            elif value <= 0:
+                raise ValueError("timeout must be positive")
+            self._routes[command_name] = Route(handler, response_frames, value)
             return handler
         return decorator
 
-    def push(self, name: Hashable | None = None) -> Callable[[F], F]:
+    def push(self, name: Optional[Hashable] = None) -> Callable[[F], F]:
         """Register a handler that starts once for every connected client.
 
         The handler may return a value, a generator, or an async generator.
@@ -87,83 +120,128 @@ class Server:
         except TypeError as exc:
             raise CommandError(str(exc), code="invalid_arguments") from exc
 
-        value = handler(*frame.args, **frame.kwargs)
+        loop = asyncio.get_running_loop()
+        if inspect.iscoroutinefunction(handler) or inspect.isasyncgenfunction(handler):
+            value = handler(*frame.args, **frame.kwargs)
+        else:
+            value = await loop.run_in_executor(
+                None, functools.partial(handler, *frame.args, **frame.kwargs)
+            )
         if inspect.isawaitable(value):
             value = await value
         if inspect.isasyncgen(value):
             async for item in value:
                 yield item
         elif inspect.isgenerator(value):
-            for item in value:
+            while True:
+                item = await loop.run_in_executor(None, _next_or_end, value)
+                if item is _GENERATOR_END:
+                    break
                 yield item
         else:
             yield value
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_tasks.add(task)
+        self._writers.add(writer)
         writer_lock = asyncio.Lock()
         push_tasks = [asyncio.create_task(self._run_push(route, writer, writer_lock)) for route in self._push_routes]
+        request_tasks: Set[asyncio.Task] = set()
         try:
             while True:
                 frame = self.frame_type()
                 try:
                     await frame.decode_from_reader(reader)
-                    if isinstance(frame, JsonLengthPrefixFrame) and frame.command == SCHEMA_COMMAND:
-                        await self._send_default_result(frame, writer, self.command_schema())
-                    else:
-                        route = self._routes.get(frame.command)
-                        assert route is not None
-                        sent = 0
-                        async for result in self.dispatch(frame):
-                            if sent == route.response_frames:
-                                break
-                            frame.decode_from_result(result)
-                            async with writer_lock:
-                                writer.write(frame.encode())
-                                await writer.drain()
-                            sent += 1
-                        if sent != route.response_frames:
-                            raise RuntimeError(
-                                f"command {frame.command!r} produced {sent} response frames; "
-                                f"expected {route.response_frames}"
-                            )
-                except asyncio.IncompleteReadError:
+                    await self._callbacks(self._on_request, frame)
+                    task = asyncio.create_task(self._handle_request(frame, writer, writer_lock))
+                    request_tasks.add(task)
+                    task.add_done_callback(request_tasks.discard)
+                except (asyncio.IncompleteReadError, ConnectionError, OSError):
                     break
-                except Exception as exc:
-                    frame.decode_from_exception(exc)
-                    encoded = frame.encode()
-                    if encoded:
-                        async with writer_lock:
-                            writer.write(encoded)
-                            await writer.drain()
         finally:
+            if task is not None:
+                self._client_tasks.discard(task)
+            self._writers.discard(writer)
+            for task in request_tasks:
+                task.cancel()
+            if request_tasks:
+                await asyncio.gather(*request_tasks, return_exceptions=True)
             for task in push_tasks:
                 task.cancel()
             if push_tasks:
                 await asyncio.gather(*push_tasks, return_exceptions=True)
             writer.close()
-            await writer.wait_closed()
+            # Do not await ProactorStreamWriter.wait_closed() here. When the
+            # peer has already reset the socket, Windows reports that reset
+            # through the close waiter and asyncio logs it as an unhandled
+            # client_connected_cb exception even if the await is caught.
+
+    async def _handle_request(self, frame: Frame, writer: asyncio.StreamWriter,
+                              writer_lock: asyncio.Lock) -> None:
+        try:
+            if isinstance(frame, JsonLengthPrefixFrame) and frame.command == SCHEMA_COMMAND:
+                await self._send_default_result(frame, writer, self.command_schema())
+                return
+            route = self._routes.get(frame.command)
+            if route is None:
+                raise CommandError(f"unknown command: {frame.command}", code="not_found")
+            sent = 0
+            async for result in self.dispatch(frame):
+                if sent == route.response_frames:
+                    break
+                frame.decode_from_result(result, frame)
+                await self._callbacks(self._on_response, frame)
+                async with writer_lock:
+                    writer.write(frame.encode())
+                    await writer.drain()
+                sent += 1
+            if sent != route.response_frames:
+                raise RuntimeError(
+                    f"command {frame.command!r} produced {sent} response frames; "
+                    f"expected {route.response_frames}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            frame.decode_from_exception(exc, frame)
+            encoded = frame.encode()
+            await self._callbacks(self._on_response, frame)
+            if encoded:
+                async with writer_lock:
+                    writer.write(encoded)
+                    await writer.drain()
 
     async def _run_push(
         self, route: PushRoute, writer: asyncio.StreamWriter, writer_lock: asyncio.Lock
     ) -> None:
         frame = self.frame_type()
         try:
-            value = route.handler()
+            loop = asyncio.get_running_loop()
+            if inspect.iscoroutinefunction(route.handler) or inspect.isasyncgenfunction(route.handler):
+                value = route.handler()
+            else:
+                value = await loop.run_in_executor(None, route.handler)
             if inspect.isawaitable(value):
                 value = await value
             if inspect.isasyncgen(value):
                 async for item in value:
                     await self._send_push(route.command, item, frame, writer, writer_lock)
             elif inspect.isgenerator(value):
-                for item in value:
+                while True:
+                    item = await loop.run_in_executor(None, _next_or_end, value)
+                    if item is _GENERATOR_END:
+                        break
                     await self._send_push(route.command, item, frame, writer, writer_lock)
             else:
                 await self._send_push(route.command, value, frame, writer, writer_lock)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            frame.decode_from_exception(exc)
+            frame.decode_from_exception(exc, frame)
             frame.command = route.command
+            await self._callbacks(self._on_push, frame)
             async with writer_lock:
                 writer.write(frame.encode())
                 await writer.drain()
@@ -176,16 +254,29 @@ class Server:
         writer: asyncio.StreamWriter,
         writer_lock: asyncio.Lock,
     ) -> None:
-        frame.decode_from_result(result)
+        frame.decode_from_result(result, frame)
         frame.command = command
+        await self._callbacks(self._on_push, frame)
         async with writer_lock:
             writer.write(frame.encode())
             await writer.drain()
 
-    async def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+    async def start(self, host: str = "127.0.0.1", port: int = 8000) -> asyncio.AbstractServer:
+        """Start listening and return the asyncio server handle.
+
+        This is useful when embedding the server in an existing event loop or
+        when tests need to reserve an ephemeral port.
+        """
+        if self._server is not None:
+            return self._server
         self._server = await asyncio.start_server(self._handle_client, host, port)
-        async with self._server:
-            await self._server.serve_forever()
+        return self._server
+
+    async def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+        """Start the server and run until it is closed."""
+        server = await self.start(host, port)
+        async with server:
+            await server.serve_forever()
 
     def exec(self, host: str = "127.0.0.1", port: int = 8000):
         asyncio.run(self.serve(host=host, port=port))
@@ -193,17 +284,27 @@ class Server:
     async def close(self) -> None:
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
             self._server = None
+        current = asyncio.current_task()
+        tasks = [task for task in self._client_tasks if task is not current]
+        for task in tasks:
+            task.cancel()
+        writers = list(self._writers)
+        self._writers.clear()
+        for writer in writers:
+            writer.close()
+            transport = getattr(writer, "transport", None)
+            if transport is not None:
+                transport.abort()
 
     @staticmethod
-    def _params_for(handler: Handler) -> list[Param]:
+    def _params_for(handler: Handler) -> List[Param]:
         signature = inspect.signature(handler)
         try:
             annotations = get_type_hints(handler)
         except (NameError, TypeError):
             annotations = {}
-        params: list[Param] = []
+        params: List[Param] = []
         for parameter in signature.parameters.values():
             if parameter.kind not in {
                 inspect.Parameter.POSITIONAL_ONLY,
@@ -220,11 +321,11 @@ class Server:
     async def _send_default_result(
         self, frame: JsonLengthPrefixFrame, writer: asyncio.StreamWriter, result: Any
     ) -> None:
-        frame.decode_from_result(result)
+        frame.decode_from_result(result, frame)
         writer.write(frame.encode())
         await writer.drain()
 
-    def command_schema(self) -> list[dict[str, Any]]:
+    def command_schema(self) -> List[Dict[str, Any]]:
         """Return serializable definitions for the built-in dynamic client."""
         definitions = []
         for command, route in self._routes.items():
@@ -253,8 +354,25 @@ class Server:
                 "command": command,
                 "parameters": parameters,
                 "response_frames": route.response_frames,
+                "timeout": route.timeout,
             })
+        for route in self._push_routes:
+            if isinstance(route.command, str):
+                definitions.append({
+                    "command": route.command,
+                    "parameters": [],
+                    "push": True,
+                })
         return definitions
+
+_GENERATOR_END = object()
+
+
+def _next_or_end(iterator: Any) -> Any:
+    try:
+        return next(iterator)
+    except StopIteration:
+        return _GENERATOR_END
 
 
 def _type_name(annotation: Any) -> str:

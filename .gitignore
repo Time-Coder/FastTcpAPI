@@ -1,8 +1,7 @@
 __pycache__
+.pytest_cache
 build
 dist
 examples
-tests
-async_client.pyi
-sync_client.pyi
+client.pyi
 *.egg-info

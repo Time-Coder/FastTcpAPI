@@ -168,7 +168,7 @@ protocol.
 
 ## Client
 
-`AsyncClient` supports the built-in `JsonLengthPrefixFrame` protocol. Start the
+`Client` supports the built-in `JsonLengthPrefixFrame` protocol. Start the
 server, then run the included client example in another terminal:
 
 ```console
@@ -177,10 +177,9 @@ python examples/client.py
 ```
 
 ```python
-from fasttcpapi import AsyncClient, RemoteError
+from fasttcpapi import Client, RemoteError
 
-client = AsyncClient("127.0.0.1", 9000)
-await client.connect()  # Fetches the server's public command definitions.
+client = Client("127.0.0.1", 9000, sync=False)
 
 message = await client.echo("FastTcpAPI", prefix="Hello, ")
 ticks = await client.call("clock.watch")  # response_frames=2: returns a two-item list.
@@ -191,9 +190,30 @@ keyword names, required arguments, and built-in `bool`, `bytes`, `float`,
 `int`, and `str` annotations from the fetched definition. A mismatch raises
 `TypeError` locally; it does not open a command request to the server.
 
-The first connection writes `fasttcpapi/async_client.pyi` and
-`fasttcpapi/sync_client.pyi`. They contain the server's valid Python command
-names and parameter types, so an IDE can use them as local type-stub artifacts.
+The client keeps one TCP connection open and routes response frames by the
+`session_id` supplied by each request `Frame`. Responses with an unknown
+session ID are discarded. Set `timeout` on `@server.command` to a positive number, or provide a
+list with one value per response frame. A missing matching response raises
+`TimeoutError` in the client.
+
+The service definition marks push commands with `push: true`. The client uses
+that command list to route matching frames to its push queue; all other frames
+are routed by `session_id` to the waiting call. Custom frame protocols only
+need to preserve the command and session fields they define; no extra frame
+type field is required. Push frames are available through
+`await client.next_push()`.
+
+`Client(..., push_queue_size=100)` bounds the local push queue. When full, the
+oldest unread push is discarded so a fast producer cannot grow client memory
+without limit.
+
+For diagnostics, both `Client` and `Server` provide
+`add_on_request_callback`, `add_on_response_callback`, and
+`add_on_push_callback`. Callbacks may be synchronous or asynchronous; callback
+errors are ignored so logging cannot break request processing.
+
+The first connection writes `fasttcpapi/client.pyi` alongside the client module.
+It describes the command proxy's `__call__(...)` method.
 Commands containing dots or
 other non-identifier characters remain callable with:
 
@@ -209,15 +229,20 @@ built-in exception type with the same arguments. Custom exceptions, including
 back to `RemoteError`. Custom frame protocols require their own client because
 their wire format and response completion rules are application-specific.
 
-For synchronous applications use `SyncClient`:
+Set `client.sync = True` for blocking calls, or use the explicit methods:
+
+One `Client` instance owns a dedicated background event loop and TCP connection.
+It can therefore be used from multiple caller event loops and threads;
+`async_call()` bridges the result back to the caller's loop, while `submit()`
+returns a standard `concurrent.futures.Future`.
 
 ```python
-from fasttcpapi import SyncClient
+from fasttcpapi import Client
 
-client = SyncClient("127.0.0.1", 9000)
-client.connect()
-value = client.echo("FastTcpAPI")
-ticks = client.call("clock.watch")
+client = Client("127.0.0.1", 9000, sync=True)
+value = client.echo("FastTCP")
+future = client.submit("clock.watch")
+ticks = future.result()
 ```
 
 Run the complete blocking example with `python examples/sync_client.py`.

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import ctypes
 import struct
-from typing import Any
+from typing import Any, List, Tuple
 
 from .frame import Param
 
 
 def decode_typed_arguments(
-    payload: bytes, param_list: list[Param], *, byteorder: str = "little", encoding: str = "utf-8"
-) -> tuple[Any, ...]:
+    payload: bytes, param_list: List[Param], *, byteorder: str = "little", encoding: str = "utf-8"
+) -> Tuple[Any, ...]:
     """Decode positional arguments according to a handler's parameter list.
 
     Supported annotations are ``int`` (signed int32), ``float`` (IEEE-754
@@ -23,7 +23,7 @@ def decode_typed_arguments(
         raise ValueError("byteorder must be 'little' or 'big'")
 
     offset = 0
-    values: list[Any] = []
+    values: List[Any] = []
     prefix = "<" if byteorder == "little" else ">"
 
     for parameter in param_list:
@@ -35,7 +35,7 @@ def decode_typed_arguments(
     return tuple(values)
 
 
-def _decode_one(payload: bytes, offset: int, annotation: Any, prefix: str, encoding: str) -> tuple[Any, int]:
+def _decode_one(payload: bytes, offset: int, annotation: Any, prefix: str, encoding: str) -> Tuple[Any, int]:
     if annotation is int:
         return _unpack(payload, offset, prefix + "i", "int")
     if annotation is float:
@@ -61,13 +61,13 @@ def _decode_one(payload: bytes, offset: int, annotation: Any, prefix: str, encod
         raise ValueError(f"unsupported binary annotation: {annotation!r}") from exc
 
 
-def _unpack(payload: bytes, offset: int, format_string: str, type_name: str) -> tuple[Any, int]:
+def _unpack(payload: bytes, offset: int, format_string: str, type_name: str) -> Tuple[Any, int]:
     size = struct.calcsize(format_string)
     raw, next_offset = _take(payload, offset, size, type_name)
     return struct.unpack(format_string, raw)[0], next_offset
 
 
-def _take(payload: bytes, offset: int, size: int, type_name: str) -> tuple[bytes, int]:
+def _take(payload: bytes, offset: int, size: int, type_name: str) -> Tuple[bytes, int]:
     if len(payload) - offset < size:
         raise ValueError(f"{type_name} parameter needs {size} bytes")
     return payload[offset:offset + size], offset + size

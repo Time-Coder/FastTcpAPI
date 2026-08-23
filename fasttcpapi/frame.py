@@ -5,7 +5,7 @@ from __future__ import annotations
 import abc
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, List, Tuple
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,8 @@ class Param:
 
     name: str
     type: Any
+
+
 
 
 class Frame(abc.ABC):
@@ -27,27 +29,29 @@ class Frame(abc.ABC):
     """
 
     command: Any = None
-    args: tuple[Any, ...]
-    kwargs: dict[str, Any]
+    session_id: Any = 0
+    args: Tuple[Any, ...]
+    kwargs: Dict[str, Any]
 
     def __init__(self) -> None:
         self.args = ()
         self.kwargs = {}
+        self.session_id = 0
 
     @abc.abstractmethod
     async def decode_from_reader(self, reader: asyncio.StreamReader) -> None:
         """Read one request frame and assign its command, args, and kwargs."""
 
     @abc.abstractmethod
-    def parse_args(self, param_list: list[Param]) -> None:
+    def parse_args(self, param_list: List[Param]) -> None:
         """Populate ``self.args`` and/or ``self.kwargs`` from decoded data."""
 
     @abc.abstractmethod
-    def decode_from_result(self, result: Any) -> None:
+    def decode_from_result(self, result: Any, request: "Frame") -> None:
         """Transform a handler result into response command, args, and kwargs."""
 
     @abc.abstractmethod
-    def decode_from_exception(self, exception: Exception) -> None:
+    def decode_from_exception(self, exception: Exception, request: "Frame") -> None:
         """Transform a handler exception into response command, args, and kwargs."""
 
     @abc.abstractmethod

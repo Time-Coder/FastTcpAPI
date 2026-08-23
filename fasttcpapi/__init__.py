@@ -2,15 +2,14 @@
 
 from .server import Server
 from .binary import decode_typed_arguments
-from .async_client import AsyncClient
+from .client import Client
 from .default_frame import JsonLengthPrefixFrame
 from .exceptions import CommandError, RemoteError
-from .sync_client import SyncClient
 from .frame import Frame, Param
 
 FastTcpAPI = Server
 
 __all__ = [
-    "AsyncClient", "CommandError", "FastTcpAPI", "Server", "Frame", "JsonLengthPrefixFrame",
-    "Param", "RemoteError", "SyncClient", "decode_typed_arguments",
+    "Client", "CommandError", "FastTcpAPI", "Server", "Frame", "JsonLengthPrefixFrame",
+    "Param", "RemoteError", "decode_typed_arguments",
 ]

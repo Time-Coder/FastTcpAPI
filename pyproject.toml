@@ -28,6 +28,12 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+]
+
 [project.urls]
 Homepage = "https://github.com/Time-Coder/FastTcpAPI"
 Repository = "https://github.com/Time-Coder/FastTcpAPI.git"
@@ -38,3 +44,6 @@ include = ["fasttcpapi*"]
 
 [tool.setuptools.exclude-package-data]
 fasttcpapi = ["*.pyi"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
