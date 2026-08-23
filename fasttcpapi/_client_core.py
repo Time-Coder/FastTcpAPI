@@ -223,7 +223,7 @@ class _ClientCore:
         wrote_method = False
         for command in schema:
             name = command["command"]
-            if not isinstance(name, str) or not name.isidentifier():
+            if not isinstance(name, str) or not name.isidentifier() or command.get("push"):
                 continue
             parameters = []
             for parameter in command["parameters"]:
@@ -234,6 +234,7 @@ class _ClientCore:
                 default = " = ..." if parameter["has_default"] else ""
                 parameters.append(f"{parameter['name']}: {annotation}{default}")
             signature = ", ".join(["self", *parameters])
+            unified_lines.append(f"    def {name}({signature}) -> Any: ...")
             wrote_method = True
         if not wrote_method:
             unified_lines.append("    pass")
