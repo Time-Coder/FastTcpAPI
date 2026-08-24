@@ -96,6 +96,30 @@ value = future.result()
 One `Client` instance can be used from multiple threads and event loops. Call
 `await client.close()` when it is no longer needed.
 
+The client normally fetches the service definition automatically. It can also
+be supplied manually with `set_service_definition`:
+
+```python
+client.set_service_definition([
+    {
+        "command": "echo",
+        "parameters": [
+            {"name": "message", "type": "str", "kind": "POSITIONAL_OR_KEYWORD",
+             "has_default": False, "default": None},
+        ],
+        "response_frames": 1,
+        "timeout": 30.0,
+    },
+    {"command": "clock.push", "push": True, "parameters": []},
+])
+```
+
+Each normal command definition contains `command`, `parameters`,
+`response_frames`, and `timeout`. Each parameter contains `name`, `type`,
+`kind`, `has_default`, and `default`. A push definition contains `command`,
+`push: true`, and optionally `parameters`. Supplying a definition skips the
+automatic definition request.
+
 ## Custom Frames
 
 Implement `Frame` and pass the class to `Server`. The framework does not impose
@@ -135,13 +159,13 @@ Both `Server` and `Client` support optional synchronous or asynchronous logging
 callbacks:
 
 ```python
-server.add_on_request_callback(on_request)
-server.add_on_response_callback(on_response)
-server.add_on_push_callback(on_push)
+server.add_request_callback(on_request)
+server.add_response_callback(on_response)
+server.add_push_callback(on_push)
 
-client.add_on_request_callback(on_request)
-client.add_on_response_callback(on_response)
-client.add_on_push_callback(on_push)
+client.add_request_callback(on_request)
+client.add_response_callback(on_response)
+client.add_push_callback(on_push)
 ```
 
 `FastTcpAPI` remains an alias for `Server`.

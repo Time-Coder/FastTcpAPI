@@ -120,7 +120,7 @@ async def test_push_callbacks_and_bounded_queue():
     received = []
     tcp_server, port = await _start(server)
     client = Client("127.0.0.1", port, push_queue_size=2)
-    client.add_on_push_callback(lambda frame: received.append(frame.args[0]))
+    client.add_push_callback(lambda frame: received.append(frame.args[0]))
     try:
         await client.connect()
         await asyncio.sleep(0.02)
@@ -263,3 +263,11 @@ async def test_server_close_terminates_a_pending_client_call():
             await asyncio.wait_for(call, 0.2)
     finally:
         await client.close()
+def test_client_accepts_manual_service_definition():
+    client = Client("127.0.0.1", 1)
+    client.set_service_definition([
+        {"command": "echo", "parameters": [], "response_frames": 1, "timeout": 1.0},
+        {"command": "updates", "push": True, "parameters": []},
+    ])
+    assert client._push_commands == {"updates"}
+    assert client._schema[0]["command"] == "echo"

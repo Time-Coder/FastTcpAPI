@@ -2,6 +2,7 @@ import asyncio
 import ctypes
 import json
 import struct
+import pytest
 
 from fasttcpapi import Server, Frame, Param, decode_typed_arguments
 
@@ -130,3 +131,18 @@ def test_typed_binary_arguments_follow_param_list():
     values = decode_typed_arguments(payload, params, byteorder="little")
     assert values[:4] == (-7, 1.25, True, "device")
     assert values[4].value == 513
+@pytest.mark.asyncio
+async def test_server_lifecycle_decorators_are_called():
+    app = Server()
+    events = []
+
+    @app.on_start
+    def started(server): events.append("start")
+
+    @app.on_close
+    def closed(server): events.append("close")
+
+    tcp = await app.start(port=0)
+    assert events == ["start"]
+    await app.close()
+    assert events == ["start", "close"]

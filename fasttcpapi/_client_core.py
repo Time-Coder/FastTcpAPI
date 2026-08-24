@@ -40,15 +40,32 @@ class _ClientCore:
         self._on_request: List[Callable[..., Any]] = []
         self._on_response: List[Callable[..., Any]] = []
         self._on_push: List[Callable[..., Any]] = []
+        self._on_connected: List[Callable[..., Any]] = []
+        self._on_disconnected: List[Callable[..., Any]] = []
 
-    def add_on_request_callback(self, callback: Callable[..., Any]) -> None:
+    def _decorator(self, callbacks, callback=None):
+        def register(function):
+            callbacks.append(function)
+            return function
+        return register if callback is None else register(callback)
+
+    def on_request(self, function=None): return self._decorator(self._on_request, function)
+    def on_response(self, function=None): return self._decorator(self._on_response, function)
+    def on_push(self, function=None): return self._decorator(self._on_push, function)
+    def on_connected(self, function=None): return self._decorator(self._on_connected, function)
+    def on_disconnected(self, function=None): return self._decorator(self._on_disconnected, function)
+
+    def add_request_callback(self, callback: Callable[..., Any]) -> None:
         self._on_request.append(callback)
 
-    def add_on_response_callback(self, callback: Callable[..., Any]) -> None:
+    def add_response_callback(self, callback: Callable[..., Any]) -> None:
         self._on_response.append(callback)
 
-    def add_on_push_callback(self, callback: Callable[..., Any]) -> None:
+    def add_push_callback(self, callback: Callable[..., Any]) -> None:
         self._on_push.append(callback)
+
+    def add_connected_callback(self, callback): self._on_connected.append(callback)
+    def add_disconnected_callback(self, callback): self._on_disconnected.append(callback)
 
     async def _callbacks(self, callbacks: List[Callable[..., Any]], *args: Any) -> None:
         for callback in callbacks:
@@ -78,16 +95,28 @@ class _ClientCore:
             schema = await self._request("__fasttcpapi__.schema", response_frames=1, timeout=30.0)
             if not isinstance(schema, list):
                 raise RuntimeError("server returned an invalid command schema")
-            self._schema = schema
-            self._push_commands = {
-                item["command"] for item in schema
-                if isinstance(item, dict) and item.get("push") is True
-            }
+            self.set_service_definition(schema)
             for frame in self._early_frames:
                 if frame.command in self._push_commands:
                     await self._put_push(frame)
             self._early_frames.clear()
-            self._write_stub(schema)
+
+    def set_service_definition(self, schema: List[Dict[str, Any]]) -> None:
+        """Set or replace the server command definition used by this client."""
+        if not isinstance(schema, list):
+            raise TypeError("service definition must be a list")
+        for item in schema:
+            if not isinstance(item, dict) or not isinstance(item.get("command"), str):
+                raise TypeError("each service definition must contain a string command")
+            if item.get("push") is True:
+                continue
+            if not isinstance(item.get("parameters", []), list):
+                raise TypeError("service definition parameters must be a list")
+            if not isinstance(item.get("response_frames", 1), int) or item.get("response_frames", 1) < 1:
+                raise ValueError("response_frames must be a positive integer")
+        self._schema = schema
+        self._push_commands = {item["command"] for item in schema if item.get("push") is True}
+        self._write_stub(schema)
 
     async def _ensure_connection(self) -> None:
         async with self._connection_lock:
@@ -95,6 +124,7 @@ class _ClientCore:
                 return
             self._reader, self._writer = await asyncio.open_connection(self.ip, self.port)
             self._reader_task = asyncio.create_task(self._reader_loop())
+            await self._callbacks(self._on_connected)
 
     async def _reader_loop(self) -> None:
         try:
@@ -116,6 +146,7 @@ class _ClientCore:
             for queue in list(self._pending.values()):
                 await queue.put(exc)
         finally:
+            await self._callbacks(self._on_disconnected)
             self._reader = None
             self._writer = None
 
@@ -214,11 +245,14 @@ class _ClientCore:
             "    def sync_call(self, command: str, *args: Any, **kwargs: Any) -> Any: ...",
             "    def async_call(self, command: str, *args: Any, **kwargs: Any) -> asyncio.Future[Any]: ...",
             "    def submit(self, command: str, *args: Any, **kwargs: Any) -> Future[Any]: ...",
-            "    def add_on_request_callback(self, callback: Any) -> None: ...",
-            "    def add_on_response_callback(self, callback: Any) -> None: ...",
-            "    def add_on_push_callback(self, callback: Any) -> None: ...",
+            "    def add_request_callback(self, callback: Any) -> None: ...",
+            "    def add_response_callback(self, callback: Any) -> None: ...",
+            "    def add_push_callback(self, callback: Any) -> None: ...",
+            "    def add_connected_callback(self, callback: Any) -> None: ...",
+            "    def add_disconnected_callback(self, callback: Any) -> None: ...",
             "    async def next_push(self) -> Any: ...",
             "    async def close(self) -> None: ...",
+            "    def set_service_definition(self, schema: Any) -> None: ...",
         ]
         wrote_method = False
         for command in schema:

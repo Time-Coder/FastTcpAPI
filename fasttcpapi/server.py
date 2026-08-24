@@ -44,15 +44,38 @@ class Server:
         self._on_push: List[Callable[..., Any]] = []
         self._on_request: List[Callable[..., Any]] = []
         self._on_response: List[Callable[..., Any]] = []
+        self._on_start: List[Callable[..., Any]] = []
+        self._on_close: List[Callable[..., Any]] = []
+        self._on_client_connected: List[Callable[..., Any]] = []
+        self._on_client_disconnected: List[Callable[..., Any]] = []
 
-    def add_on_push_callback(self, callback: Callable[..., Any]) -> None:
+    def _decorator(self, callbacks: List[Callable[..., Any]], callback: Optional[Callable[..., Any]] = None):
+        def register(function):
+            callbacks.append(function)
+            return function
+        return register if callback is None else register(callback)
+
+    def on_request(self, function=None): return self._decorator(self._on_request, function)
+    def on_response(self, function=None): return self._decorator(self._on_response, function)
+    def on_push(self, function=None): return self._decorator(self._on_push, function)
+    def on_start(self, function=None): return self._decorator(self._on_start, function)
+    def on_close(self, function=None): return self._decorator(self._on_close, function)
+    def on_client_connected(self, function=None): return self._decorator(self._on_client_connected, function)
+    def on_client_disconnected(self, function=None): return self._decorator(self._on_client_disconnected, function)
+
+    def add_push_callback(self, callback: Callable[..., Any]) -> None:
         self._on_push.append(callback)
 
-    def add_on_request_callback(self, callback: Callable[..., Any]) -> None:
+    def add_request_callback(self, callback: Callable[..., Any]) -> None:
         self._on_request.append(callback)
 
-    def add_on_response_callback(self, callback: Callable[..., Any]) -> None:
+    def add_response_callback(self, callback: Callable[..., Any]) -> None:
         self._on_response.append(callback)
+
+    def add_start_callback(self, callback): self._on_start.append(callback)
+    def add_close_callback(self, callback): self._on_close.append(callback)
+    def add_client_connected_callback(self, callback): self._on_client_connected.append(callback)
+    def add_client_disconnected_callback(self, callback): self._on_client_disconnected.append(callback)
 
     async def _callbacks(self, callbacks: List[Callable[..., Any]], *args: Any) -> None:
         for callback in callbacks:
@@ -146,6 +169,7 @@ class Server:
         if task is not None:
             self._client_tasks.add(task)
         self._writers.add(writer)
+        await self._callbacks(self._on_client_connected, reader, writer)
         writer_lock = asyncio.Lock()
         push_tasks = [asyncio.create_task(self._run_push(route, writer, writer_lock)) for route in self._push_routes]
         request_tasks: Set[asyncio.Task] = set()
@@ -161,6 +185,7 @@ class Server:
                 except (asyncio.IncompleteReadError, ConnectionError, OSError):
                     break
         finally:
+            await self._callbacks(self._on_client_disconnected, reader, writer)
             if task is not None:
                 self._client_tasks.discard(task)
             self._writers.discard(writer)
@@ -270,6 +295,7 @@ class Server:
         if self._server is not None:
             return self._server
         self._server = await asyncio.start_server(self._handle_client, host, port)
+        await self._callbacks(self._on_start, self)
         return self._server
 
     async def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
@@ -296,6 +322,7 @@ class Server:
             transport = getattr(writer, "transport", None)
             if transport is not None:
                 transport.abort()
+        await self._callbacks(self._on_close, self)
 
     @staticmethod
     def _params_for(handler: Handler) -> List[Param]:
