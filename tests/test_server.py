@@ -4,11 +4,11 @@ import json
 import struct
 import pytest
 
-from fasttcpapi import Server, Frame, Param, decode_typed_arguments
+from fasttcpapi import Server, Frame, Param, JsonFrame as BuiltinJsonFrame, decode_typed_arguments
 
 
 class JsonFrame(Frame):
-    async def decode_from_reader(self, reader):
+    async def decode(self, reader):
         size = struct.unpack("!I", await reader.readexactly(4))[0]
         payload = json.loads(await reader.readexactly(size))
         self.command = payload["command"]
@@ -20,13 +20,13 @@ class JsonFrame(Frame):
         self.args = tuple(self._args)
         self.kwargs = self._kwargs
 
-    def decode_from_result(self, result, request):
+    def set_result(self, result, request):
         self.session_id = request.session_id
         self.command = "ok"
         self.args = (result,)
         self.kwargs = {}
 
-    def decode_from_exception(self, exception, request):
+    def set_exception(self, exception, request):
         self.session_id = request.session_id
         self.command = "error"
         self.args = (str(exception),)
@@ -131,6 +131,27 @@ def test_typed_binary_arguments_follow_param_list():
     values = decode_typed_arguments(payload, params, byteorder="little")
     assert values[:4] == (-7, 1.25, True, "device")
     assert values[4].value == 513
+
+
+def test_default_frame_rejects_missing_command_before_encoding():
+    frame = BuiltinJsonFrame()
+    frame.args = (1,)
+    try:
+        frame.encode()
+    except ValueError as exc:
+        assert "frame.command" in str(exc)
+    else:
+        raise AssertionError("encoding a frame without command should fail")
+
+
+def test_base_frame_rejects_missing_command_after_assembly():
+    frame = JsonFrame()
+    try:
+        frame.validate()
+    except ValueError as exc:
+        assert "frame.command" in str(exc)
+    else:
+        raise AssertionError("an assembled frame without command should fail")
 @pytest.mark.asyncio
 async def test_server_lifecycle_decorators_are_called():
     app = Server()

@@ -36,6 +36,10 @@ def decode_typed_arguments(
 
 
 def _decode_one(payload: bytes, offset: int, annotation: Any, prefix: str, encoding: str) -> Tuple[Any, int]:
+    if annotation is bytes:
+        return payload[offset:], len(payload)
+    if annotation is bytearray:
+        return bytearray(payload[offset:]), len(payload)
     if annotation is int:
         return _unpack(payload, offset, prefix + "i", "int")
     if annotation is float:

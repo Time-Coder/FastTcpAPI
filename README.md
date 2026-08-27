@@ -79,6 +79,20 @@ definition before sending a request. Multi-frame commands return a list. A
 missing response raises `TimeoutError`; remote errors are raised by
 `Frame.result()`.
 
+With the built-in `JsonFrame`, responses use a four-byte big-endian length
+prefix followed by JSON. The response object has `command: "response"`, the
+request `session_id`, an empty `args` array, and `kwargs`. Successful responses
+contain `{"success": true, "data": value}`. Failed responses contain
+`{"success": false, "data": [exception arguments], "exception": "TypeName",
+"traceback": "..."}`; built-in exceptions are reconstructed by the client.
+
+Command parameters follow normal Python signatures, including default values.
+`Client` and `Server` accept `strict_type_check` (default `True`). In strict
+mode values must already have the annotated type; with `False`, annotated
+values are converted with that type. `Any` and unannotated parameters skip
+checking and conversion. `bytes` and `bytearray` parameters are supported by
+custom binary frames and must be the final parameter.
+
 For blocking applications:
 
 ```python
@@ -95,6 +109,14 @@ value = future.result()
 
 One `Client` instance can be used from multiple threads and event loops. Call
 `await client.close()` when it is no longer needed.
+
+Use the same custom frame type on the client when the service does not use the
+built-in JSON frame:
+
+```python
+client = Client("127.0.0.1", 9000, frame_type=MyFrame)
+client.set_service_definition([...])
+```
 
 The client normally fetches the service definition automatically. It can also
 be supplied manually with `set_service_definition`:
@@ -130,17 +152,17 @@ arguments, keyword arguments, session ID, and protocol-specific metadata.
 from fasttcpapi import Frame, Server
 
 class MyFrame(Frame):
-    async def decode_from_reader(self, reader): ...
+async def decode(self, reader): ...
     def parse_args(self, param_list): ...
-    def decode_from_result(self, result, request): ...
-    def decode_from_exception(self, exception, request): ...
+def set_result(self, result, request): ...
+def set_exception(self, exception, request): ...
     def result(self): ...
     def encode(self) -> bytes: ...
 
 server = Server(MyFrame)
 ```
 
-`decode_from_result` and `decode_from_exception` receive the original request
+`set_result` and `set_exception` receive the original request
 frame, so responses can reuse its session ID and custom metadata.
 
 For binary payloads, `decode_typed_arguments` supports `int`, `float`, `bool`,

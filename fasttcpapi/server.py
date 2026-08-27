@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from collections.abc import AsyncIterator, Hashable
 from typing import Any, Callable, Dict, List, Optional, Set, Type, TypeVar, Union, get_type_hints
 
-from .default_frame import JsonLengthPrefixFrame
+from .json_frame import JsonFrame
 from .exceptions import CommandError
 from .frame import Frame, Param
 
@@ -32,10 +32,11 @@ class PushRoute:
 
 
 class Server:
-    def __init__(self, frame_type: Type[Frame] = JsonLengthPrefixFrame) -> None:
+    def __init__(self, frame_type: Type[Frame] = JsonFrame, *, strict_type_check: bool = True) -> None:
         if not issubclass(frame_type, Frame):
             raise TypeError("frame_type must be a Frame subclass")
         self.frame_type = frame_type
+        self.strict_type_check = strict_type_check
         self._routes: Dict[Hashable, Route] = {}
         self._push_routes: List[PushRoute] = []
         self._server: Optional[asyncio.AbstractServer] = None
@@ -138,8 +139,12 @@ class Server:
             raise CommandError(f"unknown command: {frame.command}", code="not_found")
         handler = route.handler
         try:
-            frame.parse_args(self._params_for(handler))
-            inspect.signature(handler).bind(*frame.args, **frame.kwargs)
+            params = self._params_for(handler)
+            frame.parse_args(params)
+            bound = inspect.signature(handler).bind(*frame.args, **frame.kwargs)
+            self._coerce_bound_arguments(bound, params)
+            frame.args = tuple(bound.args)
+            frame.kwargs = dict(bound.kwargs)
         except TypeError as exc:
             raise CommandError(str(exc), code="invalid_arguments") from exc
 
@@ -173,17 +178,29 @@ class Server:
         writer_lock = asyncio.Lock()
         push_tasks = [asyncio.create_task(self._run_push(route, writer, writer_lock)) for route in self._push_routes]
         request_tasks: Set[asyncio.Task] = set()
+        response_tail = asyncio.get_running_loop().create_future()
+        response_tail.set_result(None)
         try:
             while True:
                 frame = self.frame_type()
                 try:
-                    await frame.decode_from_reader(reader)
+                    await frame.decode(reader)
                     await self._callbacks(self._on_request, frame)
-                    task = asyncio.create_task(self._handle_request(frame, writer, writer_lock))
+                    previous = response_tail
+                    response_tail = asyncio.get_running_loop().create_future()
+                    task = asyncio.create_task(self._handle_request(
+                        frame, writer, writer_lock, previous, response_tail
+                    ))
                     request_tasks.add(task)
                     task.add_done_callback(request_tasks.discard)
                 except (asyncio.IncompleteReadError, ConnectionError, OSError):
                     break
+                except Exception:
+                    # Frame codecs may reject corrupt data and resynchronise on
+                    # their next decode attempt. Keep this client connection alive.
+                    if reader.at_eof():
+                        break
+                    continue
         finally:
             await self._callbacks(self._on_client_disconnected, reader, writer)
             if task is not None:
@@ -204,19 +221,29 @@ class Server:
             # client_connected_cb exception even if the await is caught.
 
     async def _handle_request(self, frame: Frame, writer: asyncio.StreamWriter,
-                              writer_lock: asyncio.Lock) -> None:
+                              writer_lock: asyncio.Lock, previous: asyncio.Future,
+                              complete: asyncio.Future) -> None:
         try:
-            if isinstance(frame, JsonLengthPrefixFrame) and frame.command == SCHEMA_COMMAND:
+            if frame.command is None:
+                raise ValueError("frame.command must be set")
+            if isinstance(frame, JsonFrame) and frame.command == SCHEMA_COMMAND:
                 await self._send_default_result(frame, writer, self.command_schema())
                 return
             route = self._routes.get(frame.command)
             if route is None:
                 raise CommandError(f"unknown command: {frame.command}", code="not_found")
+            values = []
             sent = 0
             async for result in self.dispatch(frame):
                 if sent == route.response_frames:
                     break
-                frame.decode_from_result(result, frame)
+                values.append(result)
+                sent += 1
+            await previous
+            sent = 0
+            for result in values:
+                frame.set_result(result, frame)
+                frame.validate()
                 await self._callbacks(self._on_response, frame)
                 async with writer_lock:
                     writer.write(frame.encode())
@@ -230,13 +257,18 @@ class Server:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            frame.decode_from_exception(exc, frame)
+            await previous
+            frame.set_exception(exc, frame)
+            frame.validate()
             encoded = frame.encode()
             await self._callbacks(self._on_response, frame)
             if encoded:
                 async with writer_lock:
                     writer.write(encoded)
                     await writer.drain()
+        finally:
+            if not complete.done():
+                complete.set_result(None)
 
     async def _run_push(
         self, route: PushRoute, writer: asyncio.StreamWriter, writer_lock: asyncio.Lock
@@ -264,8 +296,9 @@ class Server:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            frame.decode_from_exception(exc, frame)
+            frame.set_exception(exc, frame)
             frame.command = route.command
+            frame.validate()
             await self._callbacks(self._on_push, frame)
             async with writer_lock:
                 writer.write(frame.encode())
@@ -279,10 +312,15 @@ class Server:
         writer: asyncio.StreamWriter,
         writer_lock: asyncio.Lock,
     ) -> None:
-        frame.decode_from_result(result, frame)
+        frame.set_result(result, frame)
         frame.command = command
+        if isinstance(frame, JsonFrame):
+            frame.args = (result,)
+            frame.kwargs = {}
+        frame.validate()
         await self._callbacks(self._on_push, frame)
         async with writer_lock:
+            frame.validate()
             writer.write(frame.encode())
             await writer.drain()
 
@@ -342,13 +380,44 @@ class Server:
                     f"unsupported handler parameter kind: {parameter.name}", code="invalid_arguments"
                 )
             param_type = annotations.get(parameter.name, parameter.annotation)
-            params.append(Param(parameter.name, param_type))
+            has_default = parameter.default is not inspect.Parameter.empty
+            params.append(Param(parameter.name, param_type, has_default, 
+                                parameter.default if has_default else None))
+        binary_types = (bytes, bytearray)
+        for index, param in enumerate(params):
+            if param.type in binary_types and index != len(params) - 1:
+                raise CommandError(
+                    f"bytes/bytearray parameter must be last: {param.name}",
+                    code="invalid_arguments",
+                )
         return params
 
+    def _coerce_bound_arguments(self, bound: inspect.BoundArguments, params: List[Param]) -> None:
+        expected_by_name = {param.name: param.type for param in params}
+        for name, value in list(bound.arguments.items()):
+            expected = expected_by_name.get(name, inspect.Parameter.empty)
+            if expected in (inspect.Parameter.empty, Any, None):
+                continue
+            if not isinstance(expected, type):
+                continue
+            if type(value) is expected:
+                continue
+            if self.strict_type_check:
+                raise TypeError(
+                    f"argument '{name}' must be {expected.__name__}, not {type(value).__name__}"
+                )
+            try:
+                bound.arguments[name] = expected(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise TypeError(
+                    f"argument '{name}' could not be converted to {expected.__name__}"
+                ) from exc
+
     async def _send_default_result(
-        self, frame: JsonLengthPrefixFrame, writer: asyncio.StreamWriter, result: Any
+        self, frame: JsonFrame, writer: asyncio.StreamWriter, result: Any
     ) -> None:
-        frame.decode_from_result(result, frame)
+        frame.set_result(result, frame)
+        frame.validate()
         writer.write(frame.encode())
         await writer.drain()
 

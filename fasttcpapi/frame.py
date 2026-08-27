@@ -14,6 +14,8 @@ class Param:
 
     name: str
     type: Any
+    has_default: bool = False
+    default: Any = None
 
 
 
@@ -21,7 +23,7 @@ class Param:
 class Frame(abc.ABC):
     """Decode a request and encode its response using command/argument fields.
 
-    ``decode_from_reader`` must assign ``self.command`` to the value registered
+``decode`` must assign ``self.command`` to the value registered
     by ``@app.command(...)``. Conversion methods transform a handler result or
     exception into the response's ``command``, ``args``, and ``kwargs``. A
     frame can retain arbitrary request metadata, such as session/device IDs,
@@ -29,17 +31,18 @@ class Frame(abc.ABC):
     """
 
     command: Any = None
-    session_id: Any = 0
+    session_id: Any = None
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
 
     def __init__(self) -> None:
+        self.command = None
         self.args = ()
         self.kwargs = {}
-        self.session_id = 0
+        self.session_id = None
 
     @abc.abstractmethod
-    async def decode_from_reader(self, reader: asyncio.StreamReader) -> None:
+    async def decode(self, reader: asyncio.StreamReader) -> None:
         """Read one request frame and assign its command, args, and kwargs."""
 
     @abc.abstractmethod
@@ -47,11 +50,11 @@ class Frame(abc.ABC):
         """Populate ``self.args`` and/or ``self.kwargs`` from decoded data."""
 
     @abc.abstractmethod
-    def decode_from_result(self, result: Any, request: "Frame") -> None:
+    def set_result(self, result: Any, request: "Frame") -> None:
         """Transform a handler result into response command, args, and kwargs."""
 
     @abc.abstractmethod
-    def decode_from_exception(self, exception: Exception, request: "Frame") -> None:
+    def set_exception(self, exception: Exception, request: "Frame") -> None:
         """Transform a handler exception into response command, args, and kwargs."""
 
     @abc.abstractmethod
@@ -61,3 +64,7 @@ class Frame(abc.ABC):
     @abc.abstractmethod
     def encode(self) -> bytes:
         """Encode the current command, args, and kwargs into one response."""
+
+    def validate(self) -> None:
+        if self.command is None:
+            raise ValueError("frame.command must be set before encoding")

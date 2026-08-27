@@ -6,35 +6,35 @@ import asyncio
 import builtins
 import json
 import struct
-import itertools
+import traceback
 from typing import Any, Dict, List
 
 from .exceptions import RemoteError
 from .frame import Frame, Param
 
 
-class JsonLengthPrefixFrame(Frame):
+class JsonFrame(Frame):
     """uint32 big-endian JSON length, followed by a UTF-8 JSON object."""
 
     max_frame_size = 16 * 1024 * 1024
-    _session_ids = itertools.count(1)
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.session_id = next(self._session_ids)
-
-    async def decode_from_reader(self, reader: asyncio.StreamReader) -> None:
+    async def decode(self, reader: asyncio.StreamReader) -> None:
         size = struct.unpack("!I", await reader.readexactly(4))[0]
         if size > self.max_frame_size:
             raise ValueError(f"frame exceeds {self.max_frame_size} byte limit")
         try:
-            payload = json.loads((await reader.readexactly(size)).decode("utf-8"))
+            if size < 1:
+                raise ValueError("frame payload is empty")
+            first = await reader.readexactly(1)
+            if first != b"{":
+                raise ValueError("JSON frame payload must start with '{'")
+            payload = json.loads((first + await reader.readexactly(size - 1)).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("frame is not valid UTF-8 JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("request must be a JSON object")
         self.command = payload.get("command")
-        self.session_id = payload.get("session_id", 0)
+        self.session_id = payload.get("session_id")
         self._raw_args = payload.get("args", [])
         self._raw_kwargs = payload.get("kwargs", {})
 
@@ -49,61 +49,58 @@ class JsonLengthPrefixFrame(Frame):
         self.kwargs = self._raw_kwargs
 
     def encode(self) -> bytes:
+        if self.command is None:
+            raise ValueError("frame.command must be set before encoding")
         payload: Dict[str, Any] = {"command": self.command, "args": self.args, "kwargs": self.kwargs,
                                    "session_id": self.session_id}
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return struct.pack("!I", len(body)) + body
 
-    def decode_from_result(self, result: Any, request: Frame) -> None:
+    def set_result(self, result: Any, request: Frame) -> None:
         self.session_id = request.session_id
-        self.command = "response.ok"
-        self.args = (result,)
-        self.kwargs = {}
+        self.command = "response"
+        self.args = ()
+        self.kwargs = {"success": True, "data": result}
 
-    def decode_from_exception(self, exception: Exception, request: Frame) -> None:
+    def set_exception(self, exception: Exception, request: Frame) -> None:
         self.session_id = request.session_id
-        self.command = "response.error"
+        self.command = "response"
         self.args = ()
         error: Dict[str, Any] = {
-            "code": getattr(exception, "code", "internal_error"),
-            "message": str(exception) or type(exception).__name__,
-            "solution": getattr(exception, "solution", None),
+            "success": False,
+            "data": list(exception.args),
+            "exception": type(exception).__qualname__,
+            "traceback": traceback.format_exc(),
         }
-        exception_type = type(exception)
-        if exception_type.__module__ == "builtins" and issubclass(exception_type, Exception):
-            try:
-                json.dumps(list(exception.args))
-            except (TypeError, ValueError):
-                pass
-            else:
-                error["builtin_type"] = exception_type.__qualname__
-                error["builtin_args"] = list(exception.args)
+        try:
+            json.dumps(error["data"])
+        except (TypeError, ValueError):
+            error["data"] = [str(value) for value in exception.args]
         self.kwargs = error
 
     def result(self) -> Any:
-        if self.command == "response.ok":
-            if len(self.args) != 1:
-                raise ValueError("response.ok must contain exactly one result")
-            return self.args[0]
-        if self.command == "response.error":
-            builtin_type = self.kwargs.get("builtin_type")
-            builtin_args = self.kwargs.get("builtin_args", [])
-            if isinstance(builtin_type, str) and isinstance(builtin_args, list):
-                exception_type = getattr(builtins, builtin_type, None)
+        if self.command == "response":
+            if self.kwargs.get("success") is True:
+                return self.kwargs.get("data")
+            if self.kwargs.get("success") is False:
+                exception_name = self.kwargs.get("exception")
+                exception_args = self.kwargs.get("data", [])
+                exception_type = None
+                if isinstance(exception_name, str) and isinstance(exception_args, list):
+                    exception_type = getattr(builtins, exception_name, None)
                 if (
                     isinstance(exception_type, type)
                     and issubclass(exception_type, Exception)
                     and exception_type.__module__ == "builtins"
                 ):
                     try:
-                        restored = exception_type(*builtin_args)
+                        restored = exception_type(*exception_args)
                     except Exception:
                         restored = None
                     if isinstance(restored, Exception):
                         raise restored
-            raise RemoteError(
-                self.kwargs.get("code", "internal_error"),
-                self.kwargs.get("message", "remote error"),
-                self.kwargs.get("solution"),
-            )
+                raise RemoteError(
+                    exception_name or "RemoteError",
+                    self.kwargs.get("traceback", "remote error"),
+                )
         raise ValueError(f"frame is not a result response: {self.command!r}")

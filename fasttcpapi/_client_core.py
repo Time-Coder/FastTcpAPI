@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
-import struct
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
-from .default_frame import JsonLengthPrefixFrame
+from .json_frame import JsonFrame
+from .frame import Frame
 
 
 class _ClientCore:
@@ -20,9 +19,14 @@ class _ClientCore:
     command names that are not valid Python attributes.
     """
 
-    def __init__(self, ip: str, port: int, *, push_queue_size: int = 100) -> None:
+    def __init__(self, ip: str, port: int, *, frame_type: Type[Frame] = JsonFrame,
+                 push_queue_size: int = 100, strict_type_check: bool = True) -> None:
+        if not issubclass(frame_type, Frame):
+            raise TypeError("frame_type must be a Frame subclass")
         self.ip = ip
         self.port = port
+        self.frame_type = frame_type
+        self.strict_type_check = strict_type_check
         self._schema: Optional[List[Dict[str, Any]]] = None
         self._lock = asyncio.Lock()
         self._connection_lock = asyncio.Lock()
@@ -31,10 +35,12 @@ class _ClientCore:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._pending: Dict[Any, asyncio.Queue] = {}
+        self._none_pending: List[asyncio.Queue] = []
+        self._none_pending_remaining: Dict[asyncio.Queue, int] = {}
         if push_queue_size < 1:
             raise ValueError("push_queue_size must be positive")
-        self._pushes: asyncio.Queue[JsonLengthPrefixFrame] = asyncio.Queue(maxsize=push_queue_size)
-        self._early_frames: List[JsonLengthPrefixFrame] = []
+        self._pushes: asyncio.Queue = asyncio.Queue(maxsize=push_queue_size)
+        self._early_frames: List[Frame] = []
         self._push_queue_size = push_queue_size
         self._push_commands: Set[str] = set()
         self._on_request: List[Callable[..., Any]] = []
@@ -92,6 +98,8 @@ class _ClientCore:
         async with self._lock:
             if self._schema is not None:
                 return
+            if self.frame_type is not JsonFrame:
+                raise RuntimeError("custom frame clients require set_service_definition()")
             schema = await self._request("__fasttcpapi__.schema", response_frames=1, timeout=30.0)
             if not isinstance(schema, list):
                 raise RuntimeError("server returned an invalid command schema")
@@ -130,33 +138,62 @@ class _ClientCore:
         try:
             assert self._reader is not None
             while True:
-                frame = await self._read_frame(self._reader)
+                try:
+                    frame = await self._read_frame(self._reader)
+                except (asyncio.IncompleteReadError, ConnectionError, OSError):
+                    raise
+                except Exception:
+                    # Frame codecs may reject corrupt data and resynchronise on
+                    # their next decode attempt.
+                    if self._reader is not None and self._reader.at_eof():
+                        raise ConnectionError("connection closed while decoding frame")
+                    continue
                 if frame.command in self._push_commands:
                     await self._put_push(frame)
                 else:
-                    queue = self._pending.get(frame.session_id)
-                    if queue is not None:
+                    queue = (self._none_pending[0] if frame.session_id is None and self._none_pending
+                             else self._pending.get(frame.session_id))
+                    is_schema_response = frame.command == "response" or (
+                        isinstance(frame.command, str) and frame.command.startswith("response.")
+                    )
+                    if queue is not None and (self._schema is not None or is_schema_response):
                         await self._callbacks(self._on_response, frame)
                         await queue.put(frame)
+                        if frame.session_id is None and queue in self._none_pending_remaining:
+                            self._none_pending_remaining[queue] -= 1
+                            if self._none_pending_remaining[queue] <= 0:
+                                self._none_pending_remaining.pop(queue, None)
+                                if queue in self._none_pending:
+                                    self._none_pending.remove(queue)
+                    elif self._schema is None:
+                        if len(self._early_frames) == self._push_queue_size:
+                            self._early_frames.pop(0)
+                        self._early_frames.append(frame)
                     elif self._schema is None:
                         if len(self._early_frames) == self._push_queue_size:
                             self._early_frames.pop(0)
                         self._early_frames.append(frame)
         except BaseException as exc:
-            for queue in list(self._pending.values()):
+            for queue in list(self._pending.values()) + list(self._none_pending):
                 await queue.put(exc)
         finally:
             await self._callbacks(self._on_disconnected)
+            event = getattr(self, "_disconnected_event", None)
+            if event is not None:
+                event.set()
+            event = getattr(self, "_connected_event", None)
+            if event is not None:
+                event.clear()
             self._reader = None
             self._writer = None
 
-    async def _put_push(self, frame: JsonLengthPrefixFrame) -> None:
+    async def _put_push(self, frame: Frame) -> None:
         await self._callbacks(self._on_push, frame)
         if self._pushes.full():
             self._pushes.get_nowait()
         self._pushes.put_nowait(frame)
 
-    async def next_push(self) -> JsonLengthPrefixFrame:
+    async def next_push(self) -> Frame:
         """Wait for the next unsolicited server push frame."""
         await self.connect()
         return await self._pushes.get()
@@ -168,36 +205,49 @@ class _ClientCore:
         if self._writer is not None:
             self._writer.close()
         error = ConnectionError("Client connection closed")
-        for queue in list(self._pending.values()):
+        for queue in list(self._pending.values()) + list(self._none_pending):
             await queue.put(error)
         self._pending.clear()
+        self._none_pending.clear()
+        self._none_pending_remaining.clear()
         self._reader = None
         self._writer = None
 
     async def call(self, command: str, *args: Any, **kwargs: Any) -> Any:
         """Call a command. One response returns a value; multiple return a list."""
-        await self.connect()
+        connector = getattr(self, "_connect_for_call", None)
+        if connector is not None:
+            await connector()
+        else:
+            await self.connect()
         definition = next((item for item in self._schema or [] if item["command"] == command), None)
         if definition is None:
             raise AttributeError(f"server has no command {command!r}")
-        self._validate_call(definition, args, kwargs)
+        args, kwargs = self._validate_call(definition, args, kwargs)
         return await self._request(command, *args, response_frames=definition["response_frames"],
                                    timeout=definition.get("timeout", 30.0), **kwargs)
 
     async def _request(self, command: str, *args: Any, response_frames: int,
                        timeout: Union[float, List[float]], **kwargs: Any) -> Any:
+        request_frame = self.frame_type()
+        request_frame.command = command
+        request_frame.args = args
+        request_frame.kwargs = kwargs
+        request_frame.validate()
         await self._ensure_connection()
         assert self._writer is not None
         writer = self._writer
-        request_frame = JsonLengthPrefixFrame()
         session_id = request_frame.session_id
-        queue: asyncio.Queue[JsonLengthPrefixFrame | BaseException] = asyncio.Queue()
-        self._pending[session_id] = queue
+        queue: asyncio.Queue[Frame | BaseException] = asyncio.Queue()
+        if session_id is None:
+            self._none_pending.append(queue)
+            self._none_pending_remaining[queue] = response_frames
+        else:
+            self._pending[session_id] = queue
         try:
             async with self._write_lock:
                 await self._callbacks(self._on_request, command, args, kwargs)
-                await self._write_frame(writer, {"command": command, "args": args, "kwargs": kwargs,
-                                                  "session_id": session_id})
+                await self._write_frame(writer, request_frame)
             results: List[Any] = []
             timeout_values = timeout if isinstance(timeout, list) else [timeout] * response_frames
             started = asyncio.get_running_loop().time()
@@ -211,16 +261,19 @@ class _ClientCore:
                 results.append(response.result())
             return results[0] if response_frames == 1 else results
         finally:
-            self._pending.pop(session_id, None)
+            if session_id is not None:
+                self._pending.pop(session_id, None)
+            if session_id is None and queue in self._none_pending:
+                self._none_pending.remove(queue)
+            self._none_pending_remaining.pop(queue, None)
 
-    async def _write_frame(self, writer: asyncio.StreamWriter, payload: Dict[str, Any]) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        writer.write(struct.pack("!I", len(body)) + body)
+    async def _write_frame(self, writer: asyncio.StreamWriter, frame: Frame) -> None:
+        writer.write(frame.encode())
         await writer.drain()
 
-    async def _read_frame(self, reader: asyncio.StreamReader) -> JsonLengthPrefixFrame:
-        frame = JsonLengthPrefixFrame()
-        await frame.decode_from_reader(reader)
+    async def _read_frame(self, reader: asyncio.StreamReader) -> Frame:
+        frame = self.frame_type()
+        await frame.decode(reader)
         frame.parse_args([])
         return frame
 
@@ -238,7 +291,7 @@ class _ClientCore:
             "    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...",
             "",
             "class Client:",
-            "    def __init__(self, ip: str, port: int, *, sync: bool = ..., push_queue_size: int = ...) -> None: ...",
+            "    def __init__(self, ip: str, port: int, *, frame_type: Any = ..., sync: bool = ..., push_queue_size: int = ..., strict_type_check: bool = ...) -> None: ...",
             "    sync: bool",
             "    def __getattr__(self, command: str) -> Command: ...",
             "    def call(self, command: str, *args: Any, **kwargs: Any) -> Any: ...",
@@ -253,6 +306,10 @@ class _ClientCore:
             "    async def next_push(self) -> Any: ...",
             "    async def close(self) -> None: ...",
             "    def set_service_definition(self, schema: Any) -> None: ...",
+            "    async def connect(self, host: Any = ..., port: Any = ...) -> None: ...",
+            "    async def disconnect(self) -> None: ...",
+            "    async def wait_for_connected(self) -> None: ...",
+            "    async def wait_for_disconnected(self) -> None: ...",
         ]
         wrote_method = False
         for command in schema:
@@ -275,8 +332,7 @@ class _ClientCore:
         package_dir = Path(__file__).parent
         (package_dir / "client.pyi").write_text("\n".join(unified_lines) + "\n", encoding="utf-8")
 
-    @staticmethod
-    def _validate_call(definition: Dict[str, Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+    def _validate_call(self, definition: Dict[str, Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]):
         parameters = []
         for item in definition["parameters"]:
             kind = getattr(inspect.Parameter, item["kind"])
@@ -287,24 +343,38 @@ class _ClientCore:
             bound = signature.bind(*args, **kwargs)
         except TypeError as exc:
             raise TypeError(_call_error(definition["command"], str(exc))) from None
+        converted = bound.arguments
         for item in definition["parameters"]:
             if item["name"] not in bound.arguments:
                 continue
             expected = _runtime_type(item["type"])
             value = bound.arguments[item["name"]]
-            if expected is not None and type(value) is not expected:
+            if expected is None or expected is Any:
+                continue
+            if type(value) is expected:
+                continue
+            if self.strict_type_check:
                 raise TypeError(
                     f"{definition['command']}() argument '{item['name']}' must be {item['type']}, "
                     f"not {type(value).__name__}"
                 )
+            try:
+                converted[item["name"]] = expected(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise TypeError(
+                    f"{definition['command']}() argument '{item['name']}' could not be converted to "
+                    f"{item['type']}"
+                ) from exc
+        return tuple(bound.args), dict(bound.kwargs)
 
 
 def _stub_type(type_name: str) -> str:
-    return type_name if type_name in {"Any", "None", "bool", "bytes", "float", "int", "str"} else "Any"
+    return type_name if type_name in {"Any", "None", "bool", "bytearray", "bytes", "float", "int", "str"} else "Any"
 
 
 def _runtime_type(type_name: str) -> Optional[type]:
-    return {"bool": bool, "bytes": bytes, "float": float, "int": int, "str": str}.get(type_name)
+    return {"bool": bool, "bytearray": bytearray, "bytes": bytes,
+            "float": float, "int": int, "str": str}.get(type_name)
 
 
 def _call_error(command: str, message: str) -> str:

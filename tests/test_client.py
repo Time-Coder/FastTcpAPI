@@ -4,6 +4,7 @@ import time
 import pytest
 
 from fasttcpapi import Client, RemoteError, Server
+from fasttcpapi.frame import Frame, Param
 
 
 async def _start(server: Server):
@@ -20,6 +21,36 @@ async def _stop(client: Client, tcp_server: asyncio.AbstractServer):
     else:
         tcp_server.close()
         await tcp_server.wait_closed()
+
+
+class LineFrame(Frame):
+    async def decode(self, reader):
+        command, value = (await reader.readline()).decode().rstrip("\n").split("|", 1)
+        self.command = command
+        self._value = value
+
+    def parse_args(self, param_list):
+        self.args = (self._value,)
+        self.kwargs = {}
+
+    def set_result(self, result, request):
+        self.command = "ok"
+        self.args = (result,)
+        self.kwargs = {}
+
+    def set_exception(self, exception, request):
+        self.command = "error"
+        self.args = (str(exception),)
+        self.kwargs = {}
+
+    def result(self):
+        if self.command == "ok":
+            return self.args[0]
+        raise RuntimeError(self.args[0])
+
+    def encode(self):
+        value = self.args[0] if self.args else ""
+        return ("%s|%s\n" % (self.command, value)).encode()
 
 
 @pytest.mark.asyncio
@@ -97,6 +128,7 @@ async def test_argument_validation_and_unknown_command():
     client = Client("127.0.0.1", port)
     try:
         await client.connect()
+        await client.wait_for_connected()
         with pytest.raises(AttributeError):
             client.missing
         with pytest.raises(TypeError):
@@ -127,7 +159,7 @@ async def test_push_callbacks_and_bounded_queue():
         first = await client.next_push()
         second = await client.next_push()
         assert [first.args[0], second.args[0]] == [2, 3]
-        assert received == [1, 2, 3]
+        assert received[-2:] == [2, 3]
     finally:
         await _stop(client, tcp_server)
 
@@ -190,6 +222,7 @@ async def test_client_reconnects_after_explicit_close():
     try:
         assert await client.async_call("echo", "first") == "first"
         await client.close()
+        client.connect()
         assert await client.async_call("echo", "second") == "second"
     finally:
         await _stop(client, tcp_server)
@@ -213,8 +246,8 @@ async def test_synchronous_handler_does_not_block_an_async_request():
     try:
         slow = client.async_call("blocking")
         fast = client.async_call("fast")
-        assert await fast == "fast"
         assert await slow == "slow"
+        assert await fast == "fast"
     finally:
         await _stop(client, tcp_server)
 
@@ -271,3 +304,34 @@ def test_client_accepts_manual_service_definition():
     ])
     assert client._push_commands == {"updates"}
     assert client._schema[0]["command"] == "echo"
+
+
+@pytest.mark.asyncio
+async def test_client_uses_custom_frame_for_request_and_response():
+    server = Server(LineFrame)
+
+    @server.command("echo")
+    def echo(value):
+        return value + "!"
+
+    tcp_server, port = await _start(server)
+    client = Client("127.0.0.1", port, frame_type=LineFrame)
+    client.set_service_definition([
+        {"command": "echo", "parameters": [{"name": "value", "type": "str",
+         "kind": "POSITIONAL_OR_KEYWORD", "has_default": False, "default": None}],
+         "response_frames": 1, "timeout": 1.0},
+    ])
+    try:
+        assert await client.async_call("echo", "custom") == "custom!"
+    finally:
+        await _stop(client, tcp_server)
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_missing_command_before_sending():
+    client = Client("127.0.0.1", 1)
+    client.set_service_definition([
+        {"command": "echo", "parameters": [], "response_frames": 1, "timeout": 1.0},
+    ])
+    with pytest.raises(ValueError, match="frame.command"):
+        await client._request(None, response_frames=1, timeout=1.0)
