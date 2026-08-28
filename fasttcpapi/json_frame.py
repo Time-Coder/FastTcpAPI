@@ -7,6 +7,7 @@ import builtins
 import json
 import struct
 import traceback
+import uuid
 from typing import Any, Dict, List
 
 from .exceptions import RemoteError
@@ -18,6 +19,10 @@ class JsonFrame(Frame):
 
     max_frame_size = 16 * 1024 * 1024
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.session_id = str(uuid.uuid4())
+
     async def decode(self, reader: asyncio.StreamReader) -> None:
         size = struct.unpack("!I", await reader.readexactly(4))[0]
         if size > self.max_frame_size:
@@ -28,7 +33,9 @@ class JsonFrame(Frame):
             first = await reader.readexactly(1)
             if first != b"{":
                 raise ValueError("JSON frame payload must start with '{'")
-            payload = json.loads((first + await reader.readexactly(size - 1)).decode("utf-8"))
+            raw_data = first + await reader.readexactly(size - 1)
+            self.raw_data = raw_data
+            payload = json.loads(raw_data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("frame is not valid UTF-8 JSON") from exc
         if not isinstance(payload, dict):
@@ -54,6 +61,7 @@ class JsonFrame(Frame):
         payload: Dict[str, Any] = {"command": self.command, "args": self.args, "kwargs": self.kwargs,
                                    "session_id": self.session_id}
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.raw_data = body
         return struct.pack("!I", len(body)) + body
 
     def set_result(self, result: Any, request: Frame) -> None:

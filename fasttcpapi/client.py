@@ -10,9 +10,10 @@ from typing import Any, Optional, Type
 from ._client_core import _ClientCore
 from .json_frame import JsonFrame
 from .frame import Frame
+from .loggers import ClientLogger
 
 class _Command:
-    def __init__(self, client: "Client", name: str) -> None:
+    def __init__(self, client: Client, name: str) -> None:
         self._client = client
         self.name = name
 
@@ -33,22 +34,18 @@ class Client(_ClientCore):
     ``client.command_name`` reads the current value for every call.
     """
 
-    def __init__(self, ip: str, port: int, *, frame_type: Type[Frame] = JsonFrame,
+    def __init__(self, server_host: str, server_port: int, *, self_host: Optional[str] = None,
+                 self_port: int = 0, frame_type: Type[Frame] = JsonFrame,
                  sync: bool = False, push_queue_size: int = 100,
-                 strict_type_check: bool = True) -> None:
-        super().__init__(ip, port, frame_type=frame_type, push_queue_size=push_queue_size,
-                         strict_type_check=strict_type_check)
+                 strict_type_check: bool = True,
+                 logger: Optional[Type[ClientLogger]] = None) -> None:
+        super().__init__(server_host, server_port, self_host=self_host, self_port=self_port,
+                         frame_type=frame_type, push_queue_size=push_queue_size,
+                         strict_type_check=strict_type_check, logger=logger)
         self.sync = sync
         self._submit_loop: Optional[asyncio.AbstractEventLoop] = None
         self._submit_thread: Optional[threading.Thread] = None
         self._submit_ready = threading.Event()
-        self._auto_task = None
-        self._connected_event = None
-        self._disconnected_event = None
-        # A newly created client may connect implicitly on its first call.
-        self._stop_reconnect = False
-        self._host = ip
-        self._port = port
 
     def __getattr__(self, command: str) -> _Command:
         if command.startswith("_"):
@@ -104,56 +101,33 @@ class Client(_ClientCore):
         self._submit_thread.start()
         self._submit_ready.wait()
 
-    def connect(self, host: Optional[str] = None, port: Optional[int] = None):
-        """Start background connection/reconnection and return immediately."""
+    def connect(self, host: Optional[str] = None, port: Optional[int] = None,
+                *, wait: bool = False):
+        """Start background connection/reconnection; optionally wait for success."""
         self._ensure_submit_loop()
         assert self._submit_loop is not None
         if host is not None:
-            self._host = self.ip = host
+            self.server_host = host
         if port is not None:
-            self._port = self.port = port
+            self.server_port = port
         self._stop_reconnect = False
         pending = asyncio.run_coroutine_threadsafe(self._start_reconnect_loop(), self._submit_loop)
+        if wait:
+            if self.sync:
+                pending.result()
+                return self.wait_for_connected()
+            async def wait_for_start() -> None:
+                await asyncio.wrap_future(pending)
+                await self._wait_connected_external()
+            return asyncio.ensure_future(wait_for_start())
         if not self.sync:
             return asyncio.wrap_future(pending)
 
-    async def _start_reconnect_loop(self) -> None:
-        if self._auto_task is None or self._auto_task.done():
-            self._connected_event = asyncio.Event()
-            self._disconnected_event = asyncio.Event()
-            self._disconnected_event.set()
-            self._auto_task = asyncio.create_task(self._reconnect_loop())
-
-    async def _reconnect_loop(self) -> None:
-        while not self._stop_reconnect:
-            try:
-                if self._writer is None or self._writer.is_closing():
-                    if self._schema is None:
-                        await _ClientCore.connect(self)
-                    else:
-                        await self._ensure_connection()
-                    if self._connected_event is not None:
-                        self._connected_event.set()
-                    if self._disconnected_event is not None:
-                        self._disconnected_event.clear()
-                await asyncio.sleep(0.5)
-            except Exception:
-                if self._connected_event is not None:
-                    self._connected_event.clear()
-                await asyncio.sleep(3.0)
-
-    async def _wait_connected_internal(self) -> None:
-        if self._connected_event is None:
-            await self._start_reconnect_loop()
-        await self._connected_event.wait()
-
-    async def _connect_for_call(self) -> None:
-        if self._stop_reconnect:
-            raise ConnectionError("Client is disconnected; call connect() first")
-        self.connect()
-        result = self.wait_for_connected()
-        if result is not None:
-            await result
+    async def _wait_connected_external(self) -> None:
+        pending = asyncio.run_coroutine_threadsafe(
+            self._wait_connected_internal(), self._submit_loop
+        )
+        await asyncio.wrap_future(pending)
 
     def wait_for_connected(self):
         self._ensure_submit_loop()
@@ -171,13 +145,27 @@ class Client(_ClientCore):
             return pending.result()
         return asyncio.wrap_future(pending)
 
-    def disconnect(self):
+    def disconnect(self, *, wait: bool = False):
         self._ensure_submit_loop()
         assert self._submit_loop is not None
         self._stop_reconnect = True
         pending = asyncio.run_coroutine_threadsafe(_ClientCore.close(self), self._submit_loop)
+        if wait:
+            if self.sync:
+                pending.result()
+                return self.wait_for_disconnected()
+            async def wait_for_close() -> None:
+                await asyncio.wrap_future(pending)
+                await self._wait_disconnected_external()
+            return asyncio.ensure_future(wait_for_close())
         if not self.sync:
             return asyncio.wrap_future(pending)
+
+    async def _wait_disconnected_external(self) -> None:
+        pending = asyncio.run_coroutine_threadsafe(
+            self._wait_disconnected_internal(), self._submit_loop
+        )
+        await asyncio.wrap_future(pending)
 
     def wait_for_disconnected(self):
         self._ensure_submit_loop()
@@ -193,13 +181,9 @@ class Client(_ClientCore):
             return pending.result()
         return asyncio.wrap_future(pending)
 
-    async def _wait_disconnected_internal(self) -> None:
-        if self._disconnected_event is not None:
-            await self._disconnected_event.wait()
-
     async def close(self) -> None:
         """Close the client's persistent connection."""
-        result = self.disconnect()
+        result = self.disconnect(wait=True)
         if result is not None:
             await result
 

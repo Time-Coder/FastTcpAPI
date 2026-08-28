@@ -42,6 +42,9 @@ Issues = "https://github.com/Time-Coder/FastTcpAPI/issues"
 [tool.setuptools.packages.find]
 include = ["fasttcpapi*"]
 
+[tool.setuptools.package-data]
+fasttcpapi = ["*.pyi.in"]
+
 [tool.setuptools.exclude-package-data]
 fasttcpapi = ["*.pyi"]
 

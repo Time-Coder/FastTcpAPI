@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 from .json_frame import JsonFrame
 from .frame import Frame
+from .loggers import ClientLogger, DefaultClientLogger
 
 
 class _ClientCore:
@@ -19,14 +20,24 @@ class _ClientCore:
     command names that are not valid Python attributes.
     """
 
-    def __init__(self, ip: str, port: int, *, frame_type: Type[Frame] = JsonFrame,
-                 push_queue_size: int = 100, strict_type_check: bool = True) -> None:
+    def __init__(self, server_host: str, server_port: int, *, self_host: Optional[str] = None,
+                 self_port: int = 0, frame_type: Type[Frame] = JsonFrame,
+                 push_queue_size: int = 100, strict_type_check: bool = True,
+                 logger: Optional[Type[ClientLogger]] = None) -> None:
         if not issubclass(frame_type, Frame):
             raise TypeError("frame_type must be a Frame subclass")
-        self.ip = ip
-        self.port = port
+        self.server_host = server_host
+        self.server_port = server_port
+        self.self_host = self_host
+        self.self_port = self_port
         self.frame_type = frame_type
         self.strict_type_check = strict_type_check
+        if logger is None:
+            self.logger = DefaultClientLogger(self)
+        elif isinstance(logger, type) and issubclass(logger, ClientLogger):
+            self.logger = logger(self)
+        else:
+            raise TypeError("logger must be a ClientLogger subclass")
         self._schema: Optional[List[Dict[str, Any]]] = None
         self._lock = asyncio.Lock()
         self._connection_lock = asyncio.Lock()
@@ -48,10 +59,34 @@ class _ClientCore:
         self._on_push: List[Callable[..., Any]] = []
         self._on_connected: List[Callable[..., Any]] = []
         self._on_disconnected: List[Callable[..., Any]] = []
+        self._on_retry_connect: List[Callable[..., Any]] = []
+        self._auto_task = None
+        self._connected_event = None
+        self._disconnected_event = None
+        self._stop_reconnect = False
+
+    @property
+    def server_address(self) -> Tuple[str, int]:
+        """Configured remote server address."""
+        return self.server_host, self.server_port
+
+    @property
+    def self_address(self) -> Tuple[Optional[str], int]:
+        """Current local socket address, or the configured local bind address."""
+        if self._writer is not None and not self._writer.is_closing():
+            address = self._writer.get_extra_info("sockname")
+            if isinstance(address, tuple) and len(address) >= 2:
+                return address[0], address[1]
+        return self.self_host, self.self_port
 
     def _decorator(self, callbacks, callback=None):
         def register(function):
-            callbacks.append(function)
+            async def decorated(*args: Any) -> Any:
+                value = function(*args[1:])
+                if inspect.isawaitable(value):
+                    return await value
+                return value
+            callbacks.append(decorated)
             return function
         return register if callback is None else register(callback)
 
@@ -60,6 +95,7 @@ class _ClientCore:
     def on_push(self, function=None): return self._decorator(self._on_push, function)
     def on_connected(self, function=None): return self._decorator(self._on_connected, function)
     def on_disconnected(self, function=None): return self._decorator(self._on_disconnected, function)
+    def on_retry_connect(self, function=None): return self._decorator(self._on_retry_connect, function)
 
     def add_request_callback(self, callback: Callable[..., Any]) -> None:
         self._on_request.append(callback)
@@ -73,14 +109,30 @@ class _ClientCore:
     def add_connected_callback(self, callback): self._on_connected.append(callback)
     def add_disconnected_callback(self, callback): self._on_disconnected.append(callback)
 
+    def add_retry_connect_callback(self, callback: Callable[..., Any]) -> None:
+        self._on_retry_connect.append(callback)
+
     async def _callbacks(self, callbacks: List[Callable[..., Any]], *args: Any) -> None:
         for callback in callbacks:
             try:
-                value = callback(*args)
+                try:
+                    value = callback(*args)
+                except TypeError:
+                    # Keep compatibility with callbacks written before the
+                    # client instance became the first argument.
+                    value = callback(*args[1:]) if args else callback()
                 if inspect.isawaitable(value):
                     await value
             except Exception:
                 continue
+
+    async def _logger_call(self, name: str, *args: Any) -> None:
+        try:
+            value = getattr(self.logger, name)(*args)
+            if inspect.isawaitable(value):
+                await value
+        except Exception:
+            pass
 
     def __getattr__(self, command: str) -> Callable[..., Any]:
         if command.startswith("_"):
@@ -130,9 +182,57 @@ class _ClientCore:
         async with self._connection_lock:
             if self._writer is not None and not self._writer.is_closing():
                 return
-            self._reader, self._writer = await asyncio.open_connection(self.ip, self.port)
+            local_addr = (self.self_host, self.self_port) if self.self_host is not None else None
+            self._reader, self._writer = await asyncio.open_connection(
+                self.server_host, self.server_port, local_addr=local_addr
+            )
             self._reader_task = asyncio.create_task(self._reader_loop())
-            await self._callbacks(self._on_connected)
+            await self._callbacks(self._on_connected, self)
+            await self._logger_call("on_connected")
+
+    async def _start_reconnect_loop(self) -> None:
+        if self._auto_task is None or self._auto_task.done():
+            self._connected_event = asyncio.Event()
+            self._disconnected_event = asyncio.Event()
+            self._disconnected_event.set()
+            self._auto_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self) -> None:
+        while not self._stop_reconnect:
+            try:
+                if self._writer is None or self._writer.is_closing():
+                    await self._callbacks(self._on_retry_connect, self)
+                    await self._logger_call("on_retry_connect")
+                    if self._schema is None:
+                        await _ClientCore.connect(self)
+                    else:
+                        await self._ensure_connection()
+                    if self._connected_event is not None:
+                        self._connected_event.set()
+                    if self._disconnected_event is not None:
+                        self._disconnected_event.clear()
+                await asyncio.sleep(0.5)
+            except Exception:
+                if self._connected_event is not None:
+                    self._connected_event.clear()
+                await asyncio.sleep(3.0)
+
+    async def _wait_connected_internal(self) -> None:
+        if self._connected_event is None:
+            await self._start_reconnect_loop()
+        await self._connected_event.wait()
+
+    async def _connect_for_call(self) -> None:
+        if self._stop_reconnect:
+            raise ConnectionError("Client is disconnected; call connect() first")
+        self.connect()
+        result = self.wait_for_connected()
+        if result is not None:
+            await result
+
+    async def _wait_disconnected_internal(self) -> None:
+        if self._disconnected_event is not None:
+            await self._disconnected_event.wait()
 
     async def _reader_loop(self) -> None:
         try:
@@ -157,7 +257,8 @@ class _ClientCore:
                         isinstance(frame.command, str) and frame.command.startswith("response.")
                     )
                     if queue is not None and (self._schema is not None or is_schema_response):
-                        await self._callbacks(self._on_response, frame)
+                        await self._callbacks(self._on_response, self, frame)
+                        await self._logger_call("on_response", frame)
                         await queue.put(frame)
                         if frame.session_id is None and queue in self._none_pending_remaining:
                             self._none_pending_remaining[queue] -= 1
@@ -177,7 +278,8 @@ class _ClientCore:
             for queue in list(self._pending.values()) + list(self._none_pending):
                 await queue.put(exc)
         finally:
-            await self._callbacks(self._on_disconnected)
+            await self._callbacks(self._on_disconnected, self)
+            await self._logger_call("on_disconnected")
             event = getattr(self, "_disconnected_event", None)
             if event is not None:
                 event.set()
@@ -188,7 +290,8 @@ class _ClientCore:
             self._writer = None
 
     async def _put_push(self, frame: Frame) -> None:
-        await self._callbacks(self._on_push, frame)
+        await self._callbacks(self._on_push, self, frame)
+        await self._logger_call("on_push", frame)
         if self._pushes.full():
             self._pushes.get_nowait()
         self._pushes.put_nowait(frame)
@@ -246,7 +349,8 @@ class _ClientCore:
             self._pending[session_id] = queue
         try:
             async with self._write_lock:
-                await self._callbacks(self._on_request, command, args, kwargs)
+                await self._callbacks(self._on_request, self, request_frame)
+                await self._logger_call("on_request", request_frame)
                 await self._write_frame(writer, request_frame)
             results: List[Any] = []
             timeout_values = timeout if isinstance(timeout, list) else [timeout] * response_frames
@@ -277,40 +381,14 @@ class _ClientCore:
         frame.parse_args([])
         return frame
 
-    @property
-    def stub_path(self) -> Path:
-        return Path(__file__).with_name("client.pyi")
-
     def _write_stub(self, schema: List[Dict[str, Any]]) -> None:
-        unified_lines = [
-            "from concurrent.futures import Future",
-            "from typing import Any",
-            "import asyncio",
-            "",
-            "class Command:",
-            "    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...",
-            "",
-            "class Client:",
-            "    def __init__(self, ip: str, port: int, *, frame_type: Any = ..., sync: bool = ..., push_queue_size: int = ..., strict_type_check: bool = ...) -> None: ...",
-            "    sync: bool",
-            "    def __getattr__(self, command: str) -> Command: ...",
-            "    def call(self, command: str, *args: Any, **kwargs: Any) -> Any: ...",
-            "    def sync_call(self, command: str, *args: Any, **kwargs: Any) -> Any: ...",
-            "    def async_call(self, command: str, *args: Any, **kwargs: Any) -> asyncio.Future[Any]: ...",
-            "    def submit(self, command: str, *args: Any, **kwargs: Any) -> Future[Any]: ...",
-            "    def add_request_callback(self, callback: Any) -> None: ...",
-            "    def add_response_callback(self, callback: Any) -> None: ...",
-            "    def add_push_callback(self, callback: Any) -> None: ...",
-            "    def add_connected_callback(self, callback: Any) -> None: ...",
-            "    def add_disconnected_callback(self, callback: Any) -> None: ...",
-            "    async def next_push(self) -> Any: ...",
-            "    async def close(self) -> None: ...",
-            "    def set_service_definition(self, schema: Any) -> None: ...",
-            "    async def connect(self, host: Any = ..., port: Any = ...) -> None: ...",
-            "    async def disconnect(self) -> None: ...",
-            "    async def wait_for_connected(self) -> None: ...",
-            "    async def wait_for_disconnected(self) -> None: ...",
-        ]
+        template = Path(__file__).with_name("client.pyi.in")
+        try:
+            unified_lines = template.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            # Stub generation is optional when package data is unavailable
+            # (for example, an incorrectly configured frozen application).
+            return
         wrote_method = False
         for command in schema:
             name = command["command"]

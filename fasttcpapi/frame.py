@@ -32,6 +32,7 @@ class Frame(abc.ABC):
 
     command: Any = None
     session_id: Any = None
+    raw_data: Any = None
     args: Tuple[Any, ...]
     kwargs: Dict[str, Any]
 
@@ -40,6 +41,7 @@ class Frame(abc.ABC):
         self.args = ()
         self.kwargs = {}
         self.session_id = None
+        self.raw_data = None
 
     @abc.abstractmethod
     async def decode(self, reader: asyncio.StreamReader) -> None:
@@ -50,11 +52,11 @@ class Frame(abc.ABC):
         """Populate ``self.args`` and/or ``self.kwargs`` from decoded data."""
 
     @abc.abstractmethod
-    def set_result(self, result: Any, request: "Frame") -> None:
+    def set_result(self, result: Any, request: Frame) -> None:
         """Transform a handler result into response command, args, and kwargs."""
 
     @abc.abstractmethod
-    def set_exception(self, exception: Exception, request: "Frame") -> None:
+    def set_exception(self, exception: Exception, request: Frame) -> None:
         """Transform a handler exception into response command, args, and kwargs."""
 
     @abc.abstractmethod

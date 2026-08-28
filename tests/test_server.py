@@ -158,10 +158,10 @@ async def test_server_lifecycle_decorators_are_called():
     events = []
 
     @app.on_start
-    def started(server): events.append("start")
+    def started(): events.append("start")
 
     @app.on_close
-    def closed(server): events.append("close")
+    def closed(): events.append("close")
 
     tcp = await app.start(port=0)
     assert events == ["start"]

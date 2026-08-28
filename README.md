@@ -44,6 +44,10 @@ set `response_frames` to the exact number of yielded values. Use `timeout` to
 control the client wait time. Any exception raised by a handler is converted by
 the frame implementation and returned to the client.
 
+After `await server.start(...)`, `server.address`, `server.host`, and
+`server.port` expose the actual bound listener address. This is especially
+useful when starting with `port=0`.
+
 ### Pushes
 
 ```python
@@ -58,6 +62,27 @@ async def clock_push():
 
 The push handler starts once for each connected client.
 
+### Routers
+
+Use `Router` to group commands and include them in a server. Routers can be
+nested; there is no automatic prefix, so command names remain unchanged.
+
+```python
+from fasttcpapi import Router, Server
+
+common = Router()
+
+@common.command("ping")
+def ping():
+    return "pong"
+
+admin = Router()
+admin.include_router(common)
+
+server = Server()
+server.include_router(admin)
+```
+
 ## Client
 
 ```python
@@ -65,7 +90,7 @@ import asyncio
 from fasttcpapi import Client
 
 async def main():
-    client = Client("127.0.0.1", 9000)
+    client = Client(server_host="127.0.0.1", server_port=9000)
     print(await client.echo("FastTcpAPI", prefix="Hello, "))
     push = await client.next_push()
     print(push.command, push.args)
@@ -73,6 +98,14 @@ async def main():
 
 asyncio.run(main())
 ```
+
+`client.server_address` exposes the target server address. `client.self_address`
+exposes the connected local socket address, or the configured local bind address
+before connecting.
+
+The built-in `JsonFrame` assigns a UUID session ID to each newly created frame.
+Custom frame implementations may keep the base default of `None` or provide
+their own session ID strategy.
 
 The command proxy uses `__call__` and validates arguments from the server
 definition before sending a request. Multi-frame commands return a list. A
@@ -154,8 +187,8 @@ from fasttcpapi import Frame, Server
 class MyFrame(Frame):
 async def decode(self, reader): ...
     def parse_args(self, param_list): ...
-def set_result(self, result, request): ...
-def set_exception(self, exception, request): ...
+    def set_result(self, result, request): ...
+    def set_exception(self, exception, request): ...
     def result(self): ...
     def encode(self) -> bytes: ...
 
@@ -188,6 +221,26 @@ server.add_push_callback(on_push)
 client.add_request_callback(on_request)
 client.add_response_callback(on_response)
 client.add_push_callback(on_push)
+client.add_retry_connect_callback(on_retry_connect)
 ```
 
-`FastTcpAPI` remains an alias for `Server`.
+Functions registered with `@server.on_xxx` or `@client.on_xxx` omit the owning
+`server`/`client` parameter; the decorator supplies and removes it internally.
+Callbacks registered through `add_xxx_callback` keep the owning object as their
+first parameter.
+
+The retry callback can also be registered as `@client.on_retry_connect`.
+
+Client `connected`, `disconnected`, and `retry_connect` callbacks receive the
+`Client` instance. Client request callbacks receive the assembled request
+`frame`; response and push callbacks also receive their `frame`.
+
+Server connection, request, response, and push callbacks receive a
+`ClientConnection` object as their first argument. It exposes `reader`,
+`writer`, `address`, and a mutable `metadata` dictionary for connection-local
+state.
+
+Both constructors accept a `logger` class. Subclass `ServerLogger` or
+`ClientLogger`, implement its constructor with the owning `server`/`client`,
+and override its `on_xxx` methods; a default logger is enabled when no logger
+is supplied.

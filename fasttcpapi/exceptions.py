@@ -1,3 +1,6 @@
+from typing import Any
+
+
 class CommandError(Exception):
     """An expected command failure that can be serialized by a frame codec."""
 
@@ -5,9 +8,9 @@ class CommandError(Exception):
         self,
         message: str,
         *,
-        code: object = "command_error",
-        solution: object = None,
-        data: object = None,
+        code: Any = "command_error",
+        solution: Any = None,
+        data: Any = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -18,7 +21,7 @@ class CommandError(Exception):
 class RemoteError(Exception):
     """An exception represented by a response frame received from a server."""
 
-    def __init__(self, code: object, message: str, solution: object = None) -> None:
+    def __init__(self, code: Any, message: str, solution: Any = None) -> None:
         super().__init__(message)
         self.code = code
         self.solution = solution

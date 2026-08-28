@@ -5,42 +5,37 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-from dataclasses import dataclass
 from collections.abc import AsyncIterator, Hashable
-from typing import Any, Callable, Dict, List, Optional, Set, Type, TypeVar, Union, get_type_hints
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union, get_type_hints
 
 from .json_frame import JsonFrame
 from .exceptions import CommandError
 from .frame import Frame, Param
+from .loggers import DefaultServerLogger, ServerLogger
+from .router import Route, PushRoute, Router, SCHEMA_COMMAND
+from .client_connection import ClientConnection
 
 Handler = Callable[..., Any]
 F = TypeVar("F", bound=Handler)
-SCHEMA_COMMAND = "__fasttcpapi__.schema"
-
-
-@dataclass(frozen=True)
-class Route:
-    handler: Handler
-    response_frames: int
-    timeout: Union[float, List[float]]
-
-
-@dataclass(frozen=True)
-class PushRoute:
-    command: Hashable
-    handler: Handler
-
-
 class Server:
-    def __init__(self, frame_type: Type[Frame] = JsonFrame, *, strict_type_check: bool = True) -> None:
+    def __init__(self, frame_type: Type[Frame] = JsonFrame, *, strict_type_check: bool = True,
+                 logger: Optional[Type[ServerLogger]] = None) -> None:
         if not issubclass(frame_type, Frame):
             raise TypeError("frame_type must be a Frame subclass")
         self.frame_type = frame_type
         self.strict_type_check = strict_type_check
+        if logger is None:
+            self.logger = DefaultServerLogger(self)
+        elif isinstance(logger, type) and issubclass(logger, ServerLogger):
+            self.logger = logger(self)
+        else:
+            raise TypeError("logger must be a ServerLogger subclass")
         self._routes: Dict[Hashable, Route] = {}
         self._push_routes: List[PushRoute] = []
         self._server: Optional[asyncio.AbstractServer] = None
+        self._address: Optional[Tuple[Any, ...]] = None
         self._writers: Set[asyncio.StreamWriter] = set()
+        self._clients: Set[ClientConnection] = set()
         self._client_tasks: Set[asyncio.Task] = set()
         self._on_push: List[Callable[..., Any]] = []
         self._on_request: List[Callable[..., Any]] = []
@@ -50,19 +45,50 @@ class Server:
         self._on_client_connected: List[Callable[..., Any]] = []
         self._on_client_disconnected: List[Callable[..., Any]] = []
 
+    @property
+    def address(self) -> Optional[Tuple[Any, ...]]:
+        """Actual listening socket address, or None before start/after close."""
+        return self._address
+
+    @property
+    def host(self) -> Optional[str]:
+        return None if self._address is None else str(self._address[0])
+
+    @property
+    def port(self) -> Optional[int]:
+        return None if self._address is None else int(self._address[1])
+
+    def include_router(self, router: Router) -> None:
+        """Include routes from a Router, including routers nested within it."""
+        if not isinstance(router, Router):
+            raise TypeError("router must be a Router instance")
+        for command, route in router._routes.items():
+            if command in self._routes or any(r.command == command for r in self._push_routes):
+                raise ValueError(f"command already registered: {command}")
+            self._routes[command] = route
+        for route in router._push_routes:
+            if route.command in self._routes or any(r.command == route.command for r in self._push_routes):
+                raise ValueError(f"command already registered: {route.command}")
+            self._push_routes.append(route)
+
     def _decorator(self, callbacks: List[Callable[..., Any]], callback: Optional[Callable[..., Any]] = None):
         def register(function):
-            callbacks.append(function)
+            async def decorated(*args: Any) -> Any:
+                value = function(*args[1:])
+                if inspect.isawaitable(value):
+                    return await value
+                return value
+            callbacks.append(decorated)
             return function
         return register if callback is None else register(callback)
 
-    def on_request(self, function=None): return self._decorator(self._on_request, function)
-    def on_response(self, function=None): return self._decorator(self._on_response, function)
-    def on_push(self, function=None): return self._decorator(self._on_push, function)
-    def on_start(self, function=None): return self._decorator(self._on_start, function)
-    def on_close(self, function=None): return self._decorator(self._on_close, function)
-    def on_client_connected(self, function=None): return self._decorator(self._on_client_connected, function)
-    def on_client_disconnected(self, function=None): return self._decorator(self._on_client_disconnected, function)
+    def on_request(self, function: Optional[Callable[..., Any]] = None) -> Callable[..., Any]: return self._decorator(self._on_request, function)
+    def on_response(self, function: Optional[Callable[..., Any]] = None) -> Callable[..., Any]: return self._decorator(self._on_response, function)
+    def on_push(self, function: Optional[Callable[..., Any]] = None) -> Callable[..., Any]: return self._decorator(self._on_push, function)
+    def on_start(self, function: Optional[Callable[..., Any]] = None) -> Callable[..., Any]: return self._decorator(self._on_start, function)
+    def on_close(self, function: Optional[Callable[..., Any]] = None) -> Callable[..., Any]: return self._decorator(self._on_close, function)
+    def on_client_connected(self, function: Optional[Callable[..., Any]] = None) -> Callable[..., Any]: return self._decorator(self._on_client_connected, function)
+    def on_client_disconnected(self, function: Optional[Callable[..., Any]] = None) -> Callable[..., Any]: return self._decorator(self._on_client_disconnected, function)
 
     def add_push_callback(self, callback: Callable[..., Any]) -> None:
         self._on_push.append(callback)
@@ -86,6 +112,14 @@ class Server:
                     await value
             except Exception:
                 continue
+
+    async def _logger_call(self, name: str, *args: Any) -> None:
+        try:
+            value = getattr(self.logger, name)(*args)
+            if inspect.isawaitable(value):
+                await value
+        except Exception:
+            pass
 
     def command(self, name: Optional[Hashable] = None, *, response_frames: int = 1,
                 timeout: Union[float, List[float]] = 30.0) -> Callable[[F], F]:
@@ -173,10 +207,13 @@ class Server:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
+        client = ClientConnection(reader, writer)
         self._writers.add(writer)
-        await self._callbacks(self._on_client_connected, reader, writer)
+        self._clients.add(client)
+        await self._logger_call("on_client_connected", client)
+        await self._callbacks(self._on_client_connected, self, client)
         writer_lock = asyncio.Lock()
-        push_tasks = [asyncio.create_task(self._run_push(route, writer, writer_lock)) for route in self._push_routes]
+        push_tasks = [asyncio.create_task(self._run_push(route, writer, writer_lock, client)) for route in self._push_routes]
         request_tasks: Set[asyncio.Task] = set()
         response_tail = asyncio.get_running_loop().create_future()
         response_tail.set_result(None)
@@ -185,11 +222,16 @@ class Server:
                 frame = self.frame_type()
                 try:
                     await frame.decode(reader)
-                    await self._callbacks(self._on_request, frame)
-                    previous = response_tail
-                    response_tail = asyncio.get_running_loop().create_future()
+                    await self._logger_call("on_request", client, frame)
+                    await self._callbacks(self._on_request, self, client, frame)
+                    if frame.session_id is None:
+                        previous = response_tail
+                        response_tail = asyncio.get_running_loop().create_future()
+                    else:
+                        previous = asyncio.get_running_loop().create_future()
+                        previous.set_result(None)
                     task = asyncio.create_task(self._handle_request(
-                        frame, writer, writer_lock, previous, response_tail
+                        frame, writer, writer_lock, previous, response_tail, client
                     ))
                     request_tasks.add(task)
                     task.add_done_callback(request_tasks.discard)
@@ -202,10 +244,12 @@ class Server:
                         break
                     continue
         finally:
-            await self._callbacks(self._on_client_disconnected, reader, writer)
+            await self._callbacks(self._on_client_disconnected, self, client)
+            await self._logger_call("on_client_disconnected", client)
             if task is not None:
                 self._client_tasks.discard(task)
             self._writers.discard(writer)
+            self._clients.discard(client)
             for task in request_tasks:
                 task.cancel()
             if request_tasks:
@@ -222,12 +266,12 @@ class Server:
 
     async def _handle_request(self, frame: Frame, writer: asyncio.StreamWriter,
                               writer_lock: asyncio.Lock, previous: asyncio.Future,
-                              complete: asyncio.Future) -> None:
+                              complete: asyncio.Future, client: ClientConnection) -> None:
         try:
             if frame.command is None:
                 raise ValueError("frame.command must be set")
             if isinstance(frame, JsonFrame) and frame.command == SCHEMA_COMMAND:
-                await self._send_default_result(frame, writer, self.command_schema())
+                await self._send_default_result(frame, writer, self.command_schema(), client)
                 return
             route = self._routes.get(frame.command)
             if route is None:
@@ -244,7 +288,8 @@ class Server:
             for result in values:
                 frame.set_result(result, frame)
                 frame.validate()
-                await self._callbacks(self._on_response, frame)
+                await self._callbacks(self._on_response, self, client, frame)
+                await self._logger_call("on_response", client, frame)
                 async with writer_lock:
                     writer.write(frame.encode())
                     await writer.drain()
@@ -261,7 +306,8 @@ class Server:
             frame.set_exception(exc, frame)
             frame.validate()
             encoded = frame.encode()
-            await self._callbacks(self._on_response, frame)
+            await self._callbacks(self._on_response, self, client, frame)
+            await self._logger_call("on_response", client, frame)
             if encoded:
                 async with writer_lock:
                     writer.write(encoded)
@@ -271,7 +317,8 @@ class Server:
                 complete.set_result(None)
 
     async def _run_push(
-        self, route: PushRoute, writer: asyncio.StreamWriter, writer_lock: asyncio.Lock
+        self, route: PushRoute, writer: asyncio.StreamWriter, writer_lock: asyncio.Lock,
+        client: ClientConnection,
     ) -> None:
         frame = self.frame_type()
         try:
@@ -284,22 +331,23 @@ class Server:
                 value = await value
             if inspect.isasyncgen(value):
                 async for item in value:
-                    await self._send_push(route.command, item, frame, writer, writer_lock)
+                    await self._send_push(route.command, item, frame, writer, writer_lock, client)
             elif inspect.isgenerator(value):
                 while True:
                     item = await loop.run_in_executor(None, _next_or_end, value)
                     if item is _GENERATOR_END:
                         break
-                    await self._send_push(route.command, item, frame, writer, writer_lock)
+                    await self._send_push(route.command, item, frame, writer, writer_lock, client)
             else:
-                await self._send_push(route.command, value, frame, writer, writer_lock)
+                await self._send_push(route.command, value, frame, writer, writer_lock, client)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             frame.set_exception(exc, frame)
             frame.command = route.command
             frame.validate()
-            await self._callbacks(self._on_push, frame)
+            await self._callbacks(self._on_push, self, client, frame)
+            await self._logger_call("on_push", client, frame)
             async with writer_lock:
                 writer.write(frame.encode())
                 await writer.drain()
@@ -311,6 +359,7 @@ class Server:
         frame: Frame,
         writer: asyncio.StreamWriter,
         writer_lock: asyncio.Lock,
+        client: ClientConnection,
     ) -> None:
         frame.set_result(result, frame)
         frame.command = command
@@ -318,7 +367,8 @@ class Server:
             frame.args = (result,)
             frame.kwargs = {}
         frame.validate()
-        await self._callbacks(self._on_push, frame)
+        await self._callbacks(self._on_push, self, client, frame)
+        await self._logger_call("on_push", client, frame)
         async with writer_lock:
             frame.validate()
             writer.write(frame.encode())
@@ -333,7 +383,10 @@ class Server:
         if self._server is not None:
             return self._server
         self._server = await asyncio.start_server(self._handle_client, host, port)
+        if self._server.sockets:
+            self._address = self._server.sockets[0].getsockname()
         await self._callbacks(self._on_start, self)
+        await self._logger_call("on_start")
         return self._server
 
     async def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
@@ -349,6 +402,7 @@ class Server:
         if self._server is not None:
             self._server.close()
             self._server = None
+            self._address = None
         current = asyncio.current_task()
         tasks = [task for task in self._client_tasks if task is not current]
         for task in tasks:
@@ -361,6 +415,7 @@ class Server:
             if transport is not None:
                 transport.abort()
         await self._callbacks(self._on_close, self)
+        await self._logger_call("on_close")
 
     @staticmethod
     def _params_for(handler: Handler) -> List[Param]:
@@ -414,10 +469,13 @@ class Server:
                 ) from exc
 
     async def _send_default_result(
-        self, frame: JsonFrame, writer: asyncio.StreamWriter, result: Any
+        self, frame: JsonFrame, writer: asyncio.StreamWriter, result: Any,
+        client: ClientConnection,
     ) -> None:
         frame.set_result(result, frame)
         frame.validate()
+        await self._callbacks(self._on_response, self, client, frame)
+        await self._logger_call("on_response", client, frame)
         writer.write(frame.encode())
         await writer.drain()
 
