@@ -10,7 +10,7 @@ from typing import Any, Optional, Type
 from ._client_core import _ClientCore
 from .json_frame import JsonFrame
 from .frame import Frame
-from .loggers import ClientLogger
+from .loggers import ClientLogger, DefaultClientLogger
 
 class _Command:
     def __init__(self, client: Client, name: str) -> None:
@@ -38,7 +38,7 @@ class Client(_ClientCore):
                  self_port: int = 0, frame_type: Type[Frame] = JsonFrame,
                  sync: bool = False, push_queue_size: int = 100,
                  strict_type_check: bool = True,
-                 logger: Optional[Type[ClientLogger]] = None) -> None:
+                 logger: Optional[Type[ClientLogger]] = DefaultClientLogger) -> None:
         super().__init__(server_host, server_port, self_host=self_host, self_port=self_port,
                          frame_type=frame_type, push_queue_size=push_queue_size,
                          strict_type_check=strict_type_check, logger=logger)
@@ -180,12 +180,5 @@ class Client(_ClientCore):
         if self.sync:
             return pending.result()
         return asyncio.wrap_future(pending)
-
-    async def close(self) -> None:
-        """Close the client's persistent connection."""
-        result = self.disconnect(wait=True)
-        if result is not None:
-            await result
-
 
 __all__ = ["Client"]

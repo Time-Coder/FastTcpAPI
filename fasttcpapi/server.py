@@ -19,13 +19,13 @@ Handler = Callable[..., Any]
 F = TypeVar("F", bound=Handler)
 class Server:
     def __init__(self, frame_type: Type[Frame] = JsonFrame, *, strict_type_check: bool = True,
-                 logger: Optional[Type[ServerLogger]] = None) -> None:
+                 logger: Optional[Type[ServerLogger]] = DefaultServerLogger) -> None:
         if not issubclass(frame_type, Frame):
             raise TypeError("frame_type must be a Frame subclass")
         self.frame_type = frame_type
         self.strict_type_check = strict_type_check
         if logger is None:
-            self.logger = DefaultServerLogger(self)
+            self.logger: Optional[ServerLogger] = None
         elif isinstance(logger, type) and issubclass(logger, ServerLogger):
             self.logger = logger(self)
         else:
@@ -114,6 +114,8 @@ class Server:
                 continue
 
     async def _logger_call(self, name: str, *args: Any) -> None:
+        if self.logger is None:
+            return
         try:
             value = getattr(self.logger, name)(*args)
             if inspect.isawaitable(value):

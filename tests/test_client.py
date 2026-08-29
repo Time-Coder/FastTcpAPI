@@ -14,13 +14,33 @@ async def _start(server: Server):
 
 
 async def _stop(client: Client, tcp_server: asyncio.AbstractServer):
-    await client.close()
+    result = client.disconnect(wait=True)
+    if result is not None:
+        await result
     owner = getattr(tcp_server, "_fasttcpapi_owner", None)
     if owner is not None:
         await owner.close()
     else:
         tcp_server.close()
         await tcp_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_logger_none_disables_framework_logging():
+    server = Server(logger=None)
+
+    @server.command("echo")
+    def echo(value: str):
+        return value
+
+    tcp_server, port = await _start(server)
+    client = Client("127.0.0.1", port, logger=None)
+    try:
+        assert server.logger is None
+        assert client.logger is None
+        assert await client.async_call("echo", "value") == "value"
+    finally:
+        await _stop(client, tcp_server)
 
 
 class LineFrame(Frame):
@@ -205,7 +225,7 @@ async def test_two_clients_receive_only_their_own_responses():
             second.async_call("identity", "second"),
         ) == ["first", "second"]
     finally:
-        await first.close()
+        await first.disconnect(wait=True)
         await _stop(second, tcp_server)
 
 
@@ -221,7 +241,7 @@ async def test_client_reconnects_after_explicit_close():
     client = Client("127.0.0.1", port)
     try:
         assert await client.async_call("echo", "first") == "first"
-        await client.close()
+        await client.disconnect(wait=True)
         client.connect()
         assert await client.async_call("echo", "second") == "second"
     finally:
@@ -295,7 +315,7 @@ async def test_server_close_terminates_a_pending_client_call():
         with pytest.raises((ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError)):
             await asyncio.wait_for(call, 0.2)
     finally:
-        await client.close()
+        await client.disconnect(wait=True)
 def test_client_accepts_manual_service_definition():
     client = Client("127.0.0.1", 1)
     client.set_service_definition([

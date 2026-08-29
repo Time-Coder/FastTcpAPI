@@ -94,7 +94,7 @@ async def main():
     print(await client.echo("FastTcpAPI", prefix="Hello, "))
     push = await client.next_push()
     print(push.command, push.args)
-    await client.close()
+    await client.disconnect(wait=True)
 
 asyncio.run(main())
 ```
@@ -141,7 +141,7 @@ value = future.result()
 ```
 
 One `Client` instance can be used from multiple threads and event loops. Call
-`await client.close()` when it is no longer needed.
+`await client.disconnect(wait=True)` when it is no longer needed.
 
 Use the same custom frame type on the client when the service does not use the
 built-in JSON frame:
@@ -242,5 +242,5 @@ state.
 
 Both constructors accept a `logger` class. Subclass `ServerLogger` or
 `ClientLogger`, implement its constructor with the owning `server`/`client`,
-and override its `on_xxx` methods; a default logger is enabled when no logger
-is supplied.
+and override its `on_xxx` methods. A default logger is enabled when `logger`
+is omitted; pass `logger=None` to disable framework logging completely.

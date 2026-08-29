@@ -23,7 +23,7 @@ class _ClientCore:
     def __init__(self, server_host: str, server_port: int, *, self_host: Optional[str] = None,
                  self_port: int = 0, frame_type: Type[Frame] = JsonFrame,
                  push_queue_size: int = 100, strict_type_check: bool = True,
-                 logger: Optional[Type[ClientLogger]] = None) -> None:
+                 logger: Optional[Type[ClientLogger]] = DefaultClientLogger) -> None:
         if not issubclass(frame_type, Frame):
             raise TypeError("frame_type must be a Frame subclass")
         self.server_host = server_host
@@ -33,7 +33,7 @@ class _ClientCore:
         self.frame_type = frame_type
         self.strict_type_check = strict_type_check
         if logger is None:
-            self.logger = DefaultClientLogger(self)
+            self.logger: Optional[ClientLogger] = None
         elif isinstance(logger, type) and issubclass(logger, ClientLogger):
             self.logger = logger(self)
         else:
@@ -127,6 +127,8 @@ class _ClientCore:
                 continue
 
     async def _logger_call(self, name: str, *args: Any) -> None:
+        if self.logger is None:
+            return
         try:
             value = getattr(self.logger, name)(*args)
             if inspect.isawaitable(value):
