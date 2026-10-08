@@ -44,6 +44,25 @@ set `response_frames` to the exact number of yielded values. Use `timeout` to
 control the client wait time. Any exception raised by a handler is converted by
 the frame implementation and returned to the client.
 
+Every response frame is encoded and written as soon as the handler produces it, so
+a long-running handler can acknowledge a request before it finishes:
+
+```python
+@server.command("work", response_frames=2)
+async def work():
+    yield {"status": "accepted"}   # reaches the client immediately
+    await asyncio.sleep(30)
+    yield {"status": "done"}
+```
+
+Because the frames are sent as they are produced, frames a handler emitted before
+raising still reach the client, followed by the encoded exception. A `timeout` list
+matches `response_frames` one-to-one, so each frame can be given its own wait.
+
+Requests that carry a `session_id` do not wait for the previous request on the same
+connection, so two commands in flight may interleave their frames. The frames of a
+single request always arrive in the order it produced them.
+
 After `await server.start(...)`, `server.address`, `server.host`, and
 `server.port` expose the actual bound listener address. This is especially
 useful when starting with `port=0`.

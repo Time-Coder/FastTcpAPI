@@ -152,6 +152,122 @@ def test_base_frame_rejects_missing_command_after_assembly():
         assert "frame.command" in str(exc)
     else:
         raise AssertionError("an assembled frame without command should fail")
+
+
+async def _each_response_frame_is_sent_before_the_handler_finishes():
+    app = Server(JsonFrame)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @app.command("progress", response_frames=2)
+    async def progress():
+        yield "ack"
+        started.set()
+        await release.wait()
+        yield "done"
+
+    server = await app.start(port=0)
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    body = json.dumps({"command": "progress"}).encode()
+    writer.write(struct.pack("!I", len(body)) + body)
+    await writer.drain()
+
+    size = struct.unpack("!I", await reader.readexactly(4))[0]
+    first = json.loads(await reader.readexactly(size))
+    assert first["args"] == ["ack"], "the first frame must arrive before the handler returns"
+
+    release.set()
+    size = struct.unpack("!I", await reader.readexactly(4))[0]
+    second = json.loads(await reader.readexactly(size))
+    assert second["args"] == ["done"]
+
+    writer.close()
+    await writer.wait_closed()
+    await app.close()
+
+
+def test_each_response_frame_is_sent_before_the_handler_finishes():
+    asyncio.run(_each_response_frame_is_sent_before_the_handler_finishes())
+
+
+async def _frames_of_one_request_stay_ordered_when_a_connection_is_shared():
+    """Sessioned requests interleave freely, but each request keeps its own frame order.
+
+    A frame whose request carries a session id does not wait for the previous request,
+    so two in-flight commands may interleave. Within one request the frames are produced
+    and written sequentially, so they always arrive in yield order.
+    """
+    app = Server(JsonFrame)
+
+    @app.command("slow", response_frames=2)
+    async def slow(delay: float):
+        yield "a"
+        await asyncio.sleep(delay)
+        yield "b"
+
+    server = await app.start(port=0)
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+    def frame(command, session_id, delay):
+        body = json.dumps({"command": command, "kwargs": {"delay": delay},
+                           "session_id": session_id}).encode()
+        return struct.pack("!I", len(body)) + body
+
+    writer.write(frame("slow", "first", 0.2))
+    await writer.drain()
+    await asyncio.sleep(0.02)
+    writer.write(frame("slow", "second", 0.0))
+    await writer.drain()
+
+    order = []
+    for _ in range(4):
+        size = struct.unpack("!I", await reader.readexactly(4))[0]
+        payload = json.loads(await reader.readexactly(size))
+        order.append((payload["session_id"], payload["args"][0]))
+
+    for session in ("first", "second"):
+        assert [mark for sid, mark in order if sid == session] == ["a", "b"], order
+
+    writer.close()
+    await writer.wait_closed()
+    await app.close()
+
+
+def test_frames_of_one_request_stay_ordered_when_a_connection_is_shared():
+    asyncio.run(_frames_of_one_request_stay_ordered_when_a_connection_is_shared())
+
+
+async def _frames_already_sent_survive_a_later_handler_error():
+    app = Server(JsonFrame)
+
+    @app.command("half")
+    async def half():
+        yield "ack"
+        raise RuntimeError("failed after acknowledging")
+
+    server = await app.start(port=0)
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    body = json.dumps({"command": "half"}).encode()
+    writer.write(struct.pack("!I", len(body)) + body)
+    await writer.drain()
+
+    size = struct.unpack("!I", await reader.readexactly(4))[0]
+    assert json.loads(await reader.readexactly(size))["args"] == ["ack"]
+    size = struct.unpack("!I", await reader.readexactly(4))[0]
+    assert json.loads(await reader.readexactly(size))["command"] == "error"
+
+    writer.close()
+    await writer.wait_closed()
+    await app.close()
+
+
+def test_frames_already_sent_survive_a_later_handler_error():
+    asyncio.run(_frames_already_sent_survive_a_later_handler_error())
+
+
 @pytest.mark.asyncio
 async def test_server_lifecycle_decorators_are_called():
     app = Server()

@@ -278,16 +278,17 @@ class Server:
             route = self._routes.get(frame.command)
             if route is None:
                 raise CommandError(f"unknown command: {frame.command}", code="not_found")
-            values = []
+            # Each response frame is encoded and written as soon as the handler yields
+            # it, so a slow handler can acknowledge the request before it finishes.
+            # ``previous`` is awaited before the first frame so a request without a
+            # session id still cannot overtake an earlier one on the same connection;
+            # sessioned requests may interleave, but their own frames stay ordered
+            # because a request writes them one at a time.
+            await previous
             sent = 0
             async for result in self.dispatch(frame):
                 if sent == route.response_frames:
                     break
-                values.append(result)
-                sent += 1
-            await previous
-            sent = 0
-            for result in values:
                 frame.set_result(result, frame)
                 frame.validate()
                 await self._callbacks(self._on_response, self, client, frame)
